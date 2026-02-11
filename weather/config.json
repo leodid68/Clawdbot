@@ -1,0 +1,18 @@
+{
+  "entry_threshold": 0.15,
+  "exit_threshold": 0.45,
+  "max_position_usd": 2.00,
+  "sizing_pct": 0.05,
+  "kelly_fraction": 0.25,
+  "min_ev_threshold": 0.03,
+  "max_trades_per_run": 5,
+  "max_retries": 3,
+  "retry_base_delay": 1.0,
+  "locations": "NYC",
+  "log_level": "INFO",
+  "state_file": "state.json",
+  "max_days_ahead": 7,
+  "seasonal_adjustments": true,
+  "adjacent_buckets": true,
+  "dynamic_exits": true
+}

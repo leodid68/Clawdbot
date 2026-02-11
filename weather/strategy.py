@@ -1,0 +1,567 @@
+"""Main strategy loop — scores buckets, sizes positions, manages exits."""
+
+import logging
+from datetime import datetime, timezone
+
+from .config import Config, LOCATIONS, MIN_SHARES_PER_ORDER, MIN_TICK_SIZE, TRADE_SOURCE
+from .noaa import get_noaa_forecast
+from .parsing import parse_weather_event, parse_temperature_bucket
+from .probability import estimate_bucket_probability, get_noaa_probability
+from .simmer_client import SimmerClient
+from .sizing import compute_exit_threshold, compute_position_size
+from .state import TradingState
+
+# Trade journal integration (optional)
+from . import JOURNAL_AVAILABLE, log_trade
+
+logger = logging.getLogger(__name__)
+
+# Context safeguard thresholds (defaults; overridden by Config)
+PRICE_DROP_THRESHOLD = 0.10
+
+
+# --------------------------------------------------------------------------
+# Safeguards (ported from monolith, now uses logging)
+# --------------------------------------------------------------------------
+
+def check_context_safeguards(
+    context: dict | None,
+    config: Config,
+    use_edge: bool = True,
+) -> tuple[bool, list[str]]:
+    """Check market context for deal-breakers. Returns ``(should_trade, reasons)``."""
+    if not context:
+        return True, []
+
+    reasons: list[str] = []
+    market = context.get("market", {})
+    warnings = context.get("warnings", [])
+    discipline = context.get("discipline", {})
+    slippage = context.get("slippage", {})
+    edge = context.get("edge", {})
+
+    for warning in warnings:
+        if "MARKET RESOLVED" in str(warning).upper():
+            return False, ["Market already resolved"]
+
+    warning_level = discipline.get("warning_level", "none")
+    if warning_level == "severe":
+        return False, [f"Severe flip-flop warning: {discipline.get('flip_flop_warning', '')}"]
+    elif warning_level == "mild":
+        reasons.append("Mild flip-flop warning (proceed with caution)")
+
+    # Time to resolution
+    time_str = market.get("time_to_resolution", "")
+    if time_str:
+        hours = _parse_time_to_hours(time_str)
+        if hours is not None and hours < config.time_to_resolution_min_hours:
+            return False, [f"Resolves in {hours}h — too soon"]
+
+    # Slippage
+    estimates = slippage.get("estimates", []) if slippage else []
+    if estimates:
+        slippage_pct = estimates[0].get("slippage_pct", 0)
+        if slippage_pct > config.slippage_max_pct:
+            return False, [f"Slippage too high: {slippage_pct:.1%}"]
+
+    # Edge recommendation
+    if use_edge and edge:
+        recommendation = edge.get("recommendation")
+        user_edge = edge.get("user_edge")
+        threshold = edge.get("suggested_threshold", 0)
+
+        if recommendation == "SKIP":
+            return False, ["Edge analysis: SKIP"]
+        elif recommendation == "HOLD":
+            if user_edge is not None and threshold:
+                reasons.append(f"Edge {user_edge:.1%} below threshold {threshold:.1%}")
+            else:
+                reasons.append("Edge analysis recommends HOLD")
+        elif recommendation == "TRADE":
+            reasons.append(f"Edge {user_edge:.1%} >= threshold {threshold:.1%}")
+
+    return True, reasons
+
+
+def _parse_time_to_hours(time_str: str) -> float | None:
+    """Parse '3d 5h' style string to total hours."""
+    try:
+        hours = 0.0
+        if "d" in time_str:
+            days = int(time_str.split("d")[0].strip())
+            hours += days * 24
+        if "h" in time_str:
+            h_part = time_str.split("h")[0]
+            if "d" in h_part:
+                h_part = h_part.split("d")[-1].strip()
+            hours += int(h_part)
+        return hours
+    except (ValueError, IndexError):
+        return None
+
+
+def detect_price_trend(history: list) -> dict:
+    """Analyze price history for 24h trend."""
+    if not history or len(history) < 2:
+        return {"direction": "unknown", "change_24h": 0, "is_opportunity": False}
+
+    recent_price = history[-1].get("price_yes", 0.5)
+    lookback = min(96, len(history) - 1)
+    old_price = history[-lookback].get("price_yes", recent_price)
+
+    if old_price == 0:
+        return {"direction": "unknown", "change_24h": 0, "is_opportunity": False}
+
+    change = (recent_price - old_price) / old_price
+
+    if change < -PRICE_DROP_THRESHOLD:
+        return {"direction": "down", "change_24h": change, "is_opportunity": True}
+    elif change > PRICE_DROP_THRESHOLD:
+        return {"direction": "up", "change_24h": change, "is_opportunity": False}
+    return {"direction": "flat", "change_24h": change, "is_opportunity": False}
+
+
+# --------------------------------------------------------------------------
+# Bucket scoring (adjacent buckets)
+# --------------------------------------------------------------------------
+
+def score_buckets(
+    event_markets: list[dict],
+    forecast_temp: float,
+    forecast_date: str,
+    config: Config,
+) -> list[dict]:
+    """Score all buckets in an event by expected value.
+
+    Returns a list of ``{"market": dict, "bucket": tuple, "prob": float,
+    "price": float, "ev": float}`` sorted by EV descending.
+    """
+    scored: list[dict] = []
+
+    for market in event_markets:
+        outcome_name = market.get("outcome_name", "")
+        bucket = parse_temperature_bucket(outcome_name)
+        if not bucket:
+            continue
+
+        price = market.get("external_price_yes") or 0.5
+
+        # Skip extreme prices
+        if price < MIN_TICK_SIZE or price > (1 - MIN_TICK_SIZE):
+            continue
+
+        prob = estimate_bucket_probability(
+            forecast_temp, bucket[0], bucket[1], forecast_date,
+            apply_seasonal=config.seasonal_adjustments,
+        )
+
+        ev = prob - price  # Expected value above break-even
+
+        scored.append({
+            "market": market,
+            "bucket": bucket,
+            "outcome_name": outcome_name,
+            "prob": prob,
+            "price": price,
+            "ev": ev,
+        })
+
+    scored.sort(key=lambda x: x["ev"], reverse=True)
+    return scored
+
+
+# --------------------------------------------------------------------------
+# Exit strategy
+# --------------------------------------------------------------------------
+
+def check_exit_opportunities(
+    client: SimmerClient,
+    config: Config,
+    state: TradingState,
+    dry_run: bool = True,
+    use_safeguards: bool = True,
+) -> tuple[int, int]:
+    """Check open positions for exit opportunities. Returns ``(found, executed)``."""
+    positions = client.get_positions()
+    if not positions:
+        return 0, 0
+
+    weather_positions = []
+    for pos in positions:
+        question = pos.get("question", "").lower()
+        sources = pos.get("sources", [])
+        if TRADE_SOURCE in sources or any(
+            kw in question for kw in ["temperature", "\u00b0f", "highest temp", "lowest temp"]
+        ):
+            weather_positions.append(pos)
+
+    if not weather_positions:
+        return 0, 0
+
+    logger.info("Checking %d weather positions for exit...", len(weather_positions))
+    exits_found = 0
+    exits_executed = 0
+
+    for pos in weather_positions:
+        market_id = pos.get("market_id")
+        current_price = pos.get("current_price") or pos.get("price_yes") or 0
+        shares = pos.get("shares_yes") or pos.get("shares") or 0
+        question = pos.get("question", "Unknown")[:50]
+
+        if shares < MIN_SHARES_PER_ORDER:
+            continue
+
+        # Dynamic exit threshold
+        cost_basis = state.get_cost_basis(market_id) or config.exit_threshold
+        if config.dynamic_exits:
+            time_str = pos.get("time_to_resolution", "")
+            hours = _parse_time_to_hours(time_str) if time_str else 168.0  # default 7 days
+            if hours is None:
+                hours = 168.0
+            exit_threshold = compute_exit_threshold(cost_basis, hours)
+        else:
+            exit_threshold = config.exit_threshold
+
+        if current_price >= exit_threshold:
+            exits_found += 1
+            logger.info(
+                "EXIT: %s — price $%.2f >= threshold $%.2f",
+                question, current_price, exit_threshold,
+            )
+
+            if use_safeguards:
+                context = client.get_market_context(market_id)
+                should_trade, reasons = check_context_safeguards(context, config)
+                if not should_trade:
+                    logger.info("Exit skipped: %s", "; ".join(reasons))
+                    continue
+                if reasons:
+                    logger.info("Exit warnings: %s", "; ".join(reasons))
+
+            # Race condition guard: re-read fresh position
+            fresh = client.get_position(market_id)
+            fresh_shares = 0.0
+            if fresh:
+                fresh_shares = fresh.get("shares_yes") or fresh.get("shares") or 0
+            if fresh_shares < MIN_SHARES_PER_ORDER:
+                logger.info("Position already closed for %s, skipping", market_id)
+                continue
+
+            if dry_run:
+                logger.info("[DRY RUN] Would sell %.1f shares of %s", fresh_shares, question)
+            else:
+                logger.info("Selling %.1f shares of %s...", fresh_shares, question)
+                result = client.execute_sell(market_id, fresh_shares)
+
+                if result.get("success"):
+                    exits_executed += 1
+                    trade_id = result.get("trade_id")
+                    logger.info("Sold %.1f shares @ $%.2f", fresh_shares, current_price)
+
+                    # Log to trade journal (if available)
+                    if trade_id and JOURNAL_AVAILABLE:
+                        log_trade(
+                            trade_id=trade_id,
+                            source=TRADE_SOURCE,
+                            thesis=f"Exit: price ${current_price:.2f} reached exit threshold ${exit_threshold:.2f}",
+                            action="sell",
+                        )
+
+                    state.remove_trade(market_id)
+                else:
+                    logger.error("Sell failed: %s", result.get("error", "Unknown"))
+        else:
+            logger.debug(
+                "HOLD: %s — price $%.2f < threshold $%.2f",
+                question, current_price, exit_threshold,
+            )
+
+    return exits_found, exits_executed
+
+
+# --------------------------------------------------------------------------
+# Main strategy
+# --------------------------------------------------------------------------
+
+def run_weather_strategy(
+    client: SimmerClient,
+    config: Config,
+    state: TradingState,
+    dry_run: bool = True,
+    positions_only: bool = False,
+    show_config: bool = False,
+    use_safeguards: bool = True,
+    use_trends: bool = True,
+    state_path: str | None = None,
+) -> None:
+    """Run the weather trading strategy."""
+    logger.info("Simmer Weather Trading Bot")
+    logger.info("=" * 50)
+
+    if dry_run:
+        logger.info("[DRY RUN] No trades will be executed. Use --live to enable trading.")
+
+    logger.info("Config: entry=%.0f%% exit=%.0f%% max=$%.2f kelly=%.0f%% adjacent=%s dynamic_exits=%s",
+                config.entry_threshold * 100, config.exit_threshold * 100,
+                config.max_position_usd, config.kelly_fraction * 100,
+                config.adjacent_buckets, config.dynamic_exits)
+    logger.info("Locations: %s", ", ".join(config.active_locations))
+
+    if show_config:
+        from dataclasses import fields as dc_fields
+        for f in dc_fields(config):
+            logger.info("  %s = %s", f.name, getattr(config, f.name))
+        return
+
+    if positions_only:
+        logger.info("Current Positions:")
+        positions = client.get_positions()
+        if not positions:
+            logger.info("  No open positions")
+        else:
+            for pos in positions:
+                logger.info(
+                    "  %s — YES: %.1f | NO: %.1f | P&L: $%.2f",
+                    pos.get("question", "Unknown")[:50],
+                    pos.get("shares_yes", 0),
+                    pos.get("shares_no", 0),
+                    pos.get("pnl", 0),
+                )
+        return
+
+    # Fetch portfolio balance for Kelly sizing
+    portfolio = client.get_portfolio()
+    balance = portfolio.get("balance_usdc", 0) if portfolio else 0
+    if portfolio:
+        logger.info("Portfolio: balance=$%.2f exposure=$%.2f positions=%d",
+                     balance, portfolio.get("total_exposure", 0),
+                     portfolio.get("positions_count", 0))
+
+    # Fetch markets
+    logger.info("Fetching weather markets...")
+    markets = client.fetch_weather_markets()
+    logger.info("Found %d weather markets", len(markets))
+
+    if not markets:
+        logger.info("No weather markets available")
+        return
+
+    # Group by event
+    events: dict[str, list[dict]] = {}
+    for market in markets:
+        event_id = market.get("event_id") or market.get("event_name", "unknown")
+        events.setdefault(event_id, []).append(market)
+
+    logger.info("Grouped into %d events", len(events))
+
+    forecast_cache: dict[str, dict] = {}
+    trades_executed = 0
+    opportunities_found = 0
+
+    for event_id, event_markets in events.items():
+        event_name = event_markets[0].get("event_name", "") if event_markets else ""
+        event_info = parse_weather_event(event_name)
+
+        if not event_info:
+            continue
+
+        location = event_info["location"]
+        date_str = event_info["date"]
+        metric = event_info["metric"]
+
+        if location not in config.active_locations:
+            continue
+
+        # Check max forecast horizon
+        from .probability import get_horizon_days
+        days_ahead = get_horizon_days(date_str)
+        if days_ahead > config.max_days_ahead:
+            logger.debug("Skipping %s %s — %d days ahead (max %d)",
+                         location, date_str, days_ahead, config.max_days_ahead)
+            continue
+
+        logger.info("%s %s (%s temp)", location, date_str, metric)
+
+        # Fetch NOAA forecast (cached per location)
+        if location not in forecast_cache:
+            logger.info("Fetching NOAA forecast for %s...", location)
+            forecast_cache[location] = get_noaa_forecast(
+                location, LOCATIONS,
+                max_retries=config.max_retries,
+                base_delay=config.retry_base_delay,
+            )
+
+        forecasts = forecast_cache[location]
+        day_forecast = forecasts.get(date_str, {})
+        forecast_temp = day_forecast.get(metric)
+
+        if forecast_temp is None:
+            logger.warning("No forecast available for %s %s", location, date_str)
+            continue
+
+        logger.info("NOAA forecast: %d F", forecast_temp)
+
+        # Dynamic NOAA probability
+        noaa_prob = get_noaa_probability(date_str, apply_seasonal=config.seasonal_adjustments)
+        logger.info("NOAA probability: %.1f%% (horizon %d days)", noaa_prob * 100, days_ahead)
+
+        # Score all buckets (adjacent scoring) or just the matching one
+        if config.adjacent_buckets:
+            scored = score_buckets(event_markets, forecast_temp, date_str, config)
+            tradeable = [s for s in scored if s["ev"] >= config.min_ev_threshold]
+        else:
+            # Legacy: single-match
+            tradeable = []
+            for market in event_markets:
+                outcome_name = market.get("outcome_name", "")
+                bucket = parse_temperature_bucket(outcome_name)
+                if bucket and bucket[0] <= forecast_temp <= bucket[1]:
+                    price = market.get("external_price_yes") or 0.5
+                    if MIN_TICK_SIZE <= price <= (1 - MIN_TICK_SIZE):
+                        prob = estimate_bucket_probability(
+                            forecast_temp, bucket[0], bucket[1], date_str,
+                            apply_seasonal=config.seasonal_adjustments,
+                        )
+                        tradeable.append({
+                            "market": market,
+                            "bucket": bucket,
+                            "outcome_name": outcome_name,
+                            "prob": prob,
+                            "price": price,
+                            "ev": prob - price,
+                        })
+                    break
+
+        if not tradeable:
+            logger.info("No tradeable buckets above EV threshold (%.2f)", config.min_ev_threshold)
+            continue
+
+        for entry in tradeable:
+            market = entry["market"]
+            market_id = market.get("id")
+            outcome_name = entry["outcome_name"]
+            price = entry["price"]
+            prob = entry["prob"]
+            ev = entry["ev"]
+
+            logger.info(
+                "Bucket: %s @ $%.2f — prob=%.1f%% EV=%.3f",
+                outcome_name, price, prob * 100, ev,
+            )
+
+            if price >= config.entry_threshold and ev < config.min_ev_threshold:
+                logger.info("Price $%.2f above entry threshold $%.2f — skip", price, config.entry_threshold)
+                continue
+
+            # Safeguards
+            if use_safeguards:
+                context = client.get_market_context(market_id, my_probability=prob)
+                should_trade, reasons = check_context_safeguards(context, config)
+                if not should_trade:
+                    logger.info("Safeguard blocked: %s", "; ".join(reasons))
+                    continue
+                if reasons:
+                    logger.info("Warnings: %s", "; ".join(reasons))
+
+            # Price trend
+            if use_trends:
+                history = client.get_price_history(market_id)
+                trend = detect_price_trend(history)
+                if trend["is_opportunity"]:
+                    logger.info("Price dropped %.0f%% in 24h — stronger signal", abs(trend["change_24h"]) * 100)
+
+            # Kelly position sizing
+            position_size = compute_position_size(
+                probability=prob,
+                price=price,
+                balance=balance,
+                max_position_usd=config.max_position_usd,
+                kelly_frac=config.kelly_fraction,
+            )
+
+            if position_size <= 0:
+                logger.info("Kelly says no bet (no edge at this price)")
+                continue
+
+            # Check minimum shares
+            min_cost_for_shares = MIN_SHARES_PER_ORDER * price
+            if min_cost_for_shares > position_size:
+                logger.warning(
+                    "Position size $%.2f too small for %d shares at $%.2f",
+                    position_size, MIN_SHARES_PER_ORDER, price,
+                )
+                continue
+
+            opportunities_found += 1
+
+            # Rate limit
+            if trades_executed >= config.max_trades_per_run:
+                logger.info("Max trades per run (%d) reached — skipping", config.max_trades_per_run)
+                continue
+
+            # Confidence = our probability estimate (fix: replaces the arbitrary formula)
+            confidence = round(prob, 2)
+
+            if dry_run:
+                logger.info(
+                    "[DRY RUN] Would buy $%.2f (~%.1f shares) of '%s' — confidence=%.0f%%",
+                    position_size, position_size / price, outcome_name, confidence * 100,
+                )
+            else:
+                logger.info("Executing trade: $%.2f on '%s'...", position_size, outcome_name)
+                result = client.execute_trade(market_id, "yes", position_size)
+
+                if result.get("success"):
+                    trades_executed += 1
+                    shares = result.get("shares_bought") or result.get("shares") or 0
+                    trade_id = result.get("trade_id")
+                    logger.info("Bought %.1f shares @ $%.2f", shares, price)
+
+                    # Log to trade journal (if available)
+                    if trade_id and JOURNAL_AVAILABLE:
+                        log_trade(
+                            trade_id=trade_id,
+                            source=TRADE_SOURCE,
+                            thesis=f"NOAA forecasts {forecast_temp}F for {location} on {date_str}, "
+                                   f"bucket '{outcome_name}' underpriced at ${price:.2f}",
+                            confidence=confidence,
+                            location=location,
+                            forecast_temp=forecast_temp,
+                            target_date=date_str,
+                            metric=metric,
+                        )
+
+                    # Record in state for dynamic exits
+                    state.record_trade(
+                        market_id=market_id,
+                        outcome_name=outcome_name,
+                        side="yes",
+                        cost_basis=price,
+                        shares=shares,
+                        location=location,
+                        forecast_date=date_str,
+                        forecast_temp=forecast_temp,
+                    )
+
+                    # Update remaining balance
+                    balance -= position_size
+                else:
+                    logger.error("Trade failed: %s", result.get("error", "Unknown"))
+
+    # Check exits
+    exits_found, exits_executed = check_exit_opportunities(
+        client, config, state, dry_run, use_safeguards,
+    )
+
+    # Summary
+    logger.info("=" * 50)
+    logger.info("Summary: events=%d entries=%d exits=%d trades=%d",
+                len(events), opportunities_found, exits_found,
+                trades_executed + exits_executed)
+
+    if dry_run:
+        logger.info("[DRY RUN MODE — no real trades executed]")
+
+    # Persist state
+    save_path = state_path or config.state_file
+    state.save(save_path)
