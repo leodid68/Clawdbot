@@ -1,6 +1,7 @@
 """Main strategy loop — scores buckets, sizes positions, manages exits."""
 
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 from .config import Config, LOCATIONS, MIN_SHARES_PER_ORDER, MIN_TICK_SIZE, TRADE_SOURCE
@@ -416,17 +417,20 @@ def run_weather_strategy(
                 )
         return
 
-    # Fetch portfolio balance for Kelly sizing
-    portfolio = client.get_portfolio()
+    # Parallel fetch: portfolio + markets
+    logger.info("Fetching portfolio and markets in parallel...")
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        fut_portfolio = pool.submit(client.get_portfolio)
+        fut_markets = pool.submit(client.fetch_weather_markets)
+        portfolio = fut_portfolio.result()
+        markets = fut_markets.result()
+
     balance = portfolio.get("balance_usdc", 0) if portfolio else 0
     if portfolio:
         logger.info("Portfolio: balance=$%.2f exposure=$%.2f positions=%d",
                      balance, portfolio.get("total_exposure", 0),
                      portfolio.get("positions_count", 0))
 
-    # Fetch markets
-    logger.info("Fetching weather markets...")
-    markets = client.fetch_weather_markets()
     logger.info("Found %d weather markets", len(markets))
 
     if not markets:
@@ -446,17 +450,47 @@ def run_weather_strategy(
     trades_executed = 0
     opportunities_found = 0
 
-    # Pre-fetch Open-Meteo forecasts for all active locations
-    if config.multi_source:
-        for loc_name in config.active_locations:
-            loc_data = LOCATIONS.get(loc_name)
-            if loc_data:
-                logger.info("Fetching Open-Meteo multi-model forecast for %s...", loc_name)
-                open_meteo_cache[loc_name] = get_open_meteo_forecast(
-                    loc_data["lat"], loc_data["lon"],
-                    max_retries=config.max_retries,
-                    base_delay=config.retry_base_delay,
-                )
+    # Parallel pre-fetch: NOAA + Open-Meteo for all active locations
+    active_locs = config.active_locations
+    logger.info("Pre-fetching forecasts for %d locations in parallel...", len(active_locs))
+
+    def _fetch_noaa(loc_name: str) -> tuple[str, dict]:
+        return loc_name, get_noaa_forecast(
+            loc_name, LOCATIONS,
+            max_retries=config.max_retries,
+            base_delay=config.retry_base_delay,
+        )
+
+    def _fetch_open_meteo(loc_name: str) -> tuple[str, dict]:
+        loc_data = LOCATIONS.get(loc_name)
+        if not loc_data:
+            return loc_name, {}
+        return loc_name, get_open_meteo_forecast(
+            loc_data["lat"], loc_data["lon"],
+            max_retries=config.max_retries,
+            base_delay=config.retry_base_delay,
+        )
+
+    with ThreadPoolExecutor(max_workers=len(active_locs) * 2) as pool:
+        # Submit all NOAA fetches
+        noaa_futures = {pool.submit(_fetch_noaa, loc): loc for loc in active_locs}
+        # Submit all Open-Meteo fetches (if enabled)
+        om_futures = {}
+        if config.multi_source:
+            om_futures = {pool.submit(_fetch_open_meteo, loc): loc for loc in active_locs}
+
+        for fut in as_completed(list(noaa_futures) + list(om_futures)):
+            try:
+                loc_name, data = fut.result()
+                if fut in noaa_futures:
+                    noaa_cache[loc_name] = data
+                else:
+                    open_meteo_cache[loc_name] = data
+            except Exception as exc:
+                loc = noaa_futures.get(fut) or om_futures.get(fut, "?")
+                logger.error("Forecast fetch failed for %s: %s", loc, exc)
+
+    logger.info("Forecasts ready: NOAA=%d, Open-Meteo=%d", len(noaa_cache), len(open_meteo_cache))
 
     for event_id, event_markets in events.items():
         event_name = event_markets[0].get("event_name", "") if event_markets else ""
@@ -488,16 +522,7 @@ def run_weather_strategy(
 
         logger.info("%s %s (%s temp)", location, date_str, metric)
 
-        # Fetch NOAA forecast (cached per location)
-        if location not in noaa_cache:
-            logger.info("Fetching NOAA forecast for %s...", location)
-            noaa_cache[location] = get_noaa_forecast(
-                location, LOCATIONS,
-                max_retries=config.max_retries,
-                base_delay=config.retry_base_delay,
-            )
-
-        forecasts = noaa_cache[location]
+        forecasts = noaa_cache.get(location, {})
         day_forecast = forecasts.get(date_str, {})
         noaa_temp = day_forecast.get(metric)
 
