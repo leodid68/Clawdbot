@@ -3,3 +3,7 @@ __pycache__/
 .pytest_cache/
 weather/state.json
 .claude/
+.DS_Store
+creds.json
+state.json
+polymarket/
