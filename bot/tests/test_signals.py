@@ -7,7 +7,10 @@ from bot.signals import (
     detect_arbitrage,
     detect_longshot_bias,
     detect_microstructure_edge,
+    detect_multi_choice_arbitrage,
+    scan_for_signals,
 )
+from bot.config import Config
 
 
 class TestLongshotBias(unittest.TestCase):
@@ -31,6 +34,28 @@ class TestLongshotBias(unittest.TestCase):
     def test_below_threshold(self):
         sig = detect_longshot_bias("tok4", 0.20, min_edge=0.01)
         self.assertIsNone(sig)  # bias=0.003 < 0.01
+
+    # ── Longshot min_edge fix tests ──
+
+    def test_longshot_detects_with_low_min_edge(self):
+        """Bug 2: With min_edge=0.005 (config.longshot_min_edge), longshot
+        bias is actually detected at extremes where max bias = 0.008."""
+        sig = detect_longshot_bias("tok5", 0.02, min_edge=0.005)
+        self.assertIsNotNone(sig)
+        self.assertEqual(sig.side, "SELL")
+
+    def test_longshot_blocked_with_default_03(self):
+        """With the old min_edge=0.03, max bias 0.008 never triggers."""
+        sig = detect_longshot_bias("tok6", 0.02, min_edge=0.03)
+        self.assertIsNone(sig)
+
+    def test_longshot_mid_range_low_bias(self):
+        """Mid range (0.15-0.25) has bias 0.003, detectable at 0.005 but not 0.03."""
+        sig_low = detect_longshot_bias("tok7", 0.20, min_edge=0.002)
+        self.assertIsNotNone(sig_low)
+
+        sig_high = detect_longshot_bias("tok8", 0.20, min_edge=0.005)
+        self.assertIsNone(sig_high)  # 0.003 < 0.005
 
 
 class TestArbitrage(unittest.TestCase):
@@ -77,6 +102,59 @@ class TestArbitrage(unittest.TestCase):
         # 0.50 + 0.499 = 0.999 → edge 0.001 = 10 bps < 20 bps
         sig = detect_arbitrage(book_yes, book_no, min_edge_bps=20)
         self.assertIsNone(sig)
+
+
+class TestArbitrageWiring(unittest.TestCase):
+    """Bug 3: Test that arbitrage is actually called from scan_for_signals
+    when token_pairs are provided."""
+
+    def test_arb_wired_in_scan(self):
+        class FakeClient:
+            def get_price(self, tid):
+                return {"price": "0.50"}
+
+            def get_orderbook(self, tid):
+                if tid == "yes_tok":
+                    return {
+                        "asks": [{"price": "0.45", "size": "100"}],
+                        "bids": [{"price": "0.40", "size": "100"}],
+                        "asset_id": tid,
+                    }
+                elif tid == "no_tok":
+                    return {
+                        "asks": [{"price": "0.50", "size": "100"}],
+                        "bids": [{"price": "0.45", "size": "100"}],
+                        "asset_id": tid,
+                    }
+                return {"bids": [], "asks": []}
+
+        config = Config(
+            longshot_bias=False, microstructure=False,
+            arbitrage=True, multi_choice_arbitrage=False,
+            longshot_min_edge=0.005,
+        )
+        token_pairs = {"cid1": ("yes_tok", "no_tok")}
+        # 0.45 + 0.50 = 0.95 → 5c arb
+        signals = scan_for_signals(
+            FakeClient(), [], config, token_pairs=token_pairs,
+        )
+        self.assertGreater(len(signals), 0)
+        self.assertEqual(signals[0].method, "arbitrage")
+
+    def test_arb_not_called_without_pairs(self):
+        class FakeClient:
+            def get_price(self, tid):
+                return {"price": "0.50"}
+            def get_orderbook(self, tid):
+                return {"bids": [], "asks": []}
+
+        config = Config(
+            longshot_bias=False, microstructure=False,
+            arbitrage=True, multi_choice_arbitrage=False,
+            longshot_min_edge=0.005,
+        )
+        signals = scan_for_signals(FakeClient(), [], config)
+        self.assertEqual(len(signals), 0)
 
 
 class TestMicrostructureEdge(unittest.TestCase):

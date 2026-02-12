@@ -5,13 +5,26 @@ import json
 import logging
 import sys
 from pathlib import Path
+from typing import Protocol, runtime_checkable
 
 import httpx
 from polymarket.constants import CLOB_BASE_URL
 
 from .config import Config
-from .state import TradingState
+from .scanner import run_scan_pipeline
+from .state import TradingState, state_lock
 from .strategy import run_strategy
+
+
+@runtime_checkable
+class TradingClient(Protocol):
+    """Protocol for trading client implementations."""
+
+    def get_markets(self, **filters) -> list[dict]: ...
+    def get_orderbook(self, token_id: str) -> dict: ...
+    def get_price(self, token_id: str) -> dict: ...
+    def post_order(self, *a, **kw) -> dict: ...
+    def close(self) -> None: ...
 
 
 class _PublicClient:
@@ -160,9 +173,6 @@ def main() -> None:
         return
 
     # ── Build client ─────────────────────────────────────────────────
-    # Read-only modes (--scan, --signals, dry-run) use a public HTTP
-    # wrapper that doesn't need a private key.  Live trading requires
-    # the full authenticated PolymarketClient.
     needs_auth = args.live
     client = None
 
@@ -181,63 +191,54 @@ def main() -> None:
 
     # --scan
     if args.scan:
-        from .scanner import compute_book_metrics, filter_tradeable, scan_markets
         try:
-            markets = scan_markets(client, limit=config.scan_limit)
-            for m in markets:
-                for tok in m.get("tokens", []):
-                    try:
-                        book = client.get_orderbook(tok["token_id"])
-                        tok["metrics"] = compute_book_metrics(book)
-                    except Exception:
-                        tok["metrics"] = {"liquidity_grade": "D"}
-                grades = [tok.get("metrics", {}).get("liquidity_grade", "D")
-                          for tok in m.get("tokens", [])]
-                m["liquidity_grade"] = min(grades, key=lambda g: "ABCD".index(g)) if grades else "D"
-            tradeable = filter_tradeable(markets, min_liquidity=config.min_liquidity_grade)
-            print(f"{'Question':<60} {'Grade':>5} {'Spread':>8} {'Mid':>6}")
-            print("-" * 82)
+            tradeable, mc_groups, _, _, _ = run_scan_pipeline(client, config)
+
+            # Display markets
+            print(f"{'Question':<50} {'Grade':>5} {'Spread':>8} {'Vol24h':>10} {'Liq':>8}")
+            print("-" * 84)
             for m in tradeable:
-                q = m.get("question", "")[:58]
+                q = m.get("question", "")[:48]
                 grade = m.get("liquidity_grade", "?")
-                tok = m.get("tokens", [{}])[0]
-                metrics = tok.get("metrics", {})
-                spread = metrics.get("spread", 0)
-                mid = metrics.get("mid_price", 0)
-                print(f"  {q:<58} {grade:>5} {spread:>7.4f} {mid:>6.3f}")
+                gamma = m.get("gamma", {})
+                spread = gamma.get("spread", 0)
+                vol24h = gamma.get("volume_24hr", 0)
+                liq = gamma.get("liquidity", 0)
+                print(f"  {q:<48} {grade:>5} {spread:>7.4f} {vol24h:>9.0f} {liq:>7.0f}")
             print(f"\n{len(tradeable)} tradeable market(s)")
+
+            # Display multi-choice groups
+            if mc_groups:
+                print(f"\n── Multi-choice groups ({len(mc_groups)}) ──")
+                print(f"{'Event':<50} {'N':>3} {'Σ YES':>7} {'Dev':>7}")
+                print("-" * 70)
+                for g in mc_groups:
+                    title = g.event_title[:48] if g.event_title else f"event_{g.event_id}"
+                    print(f"  {title:<48} {len(g.markets):>3} {g.yes_sum:>6.3f} {g.deviation:>+6.3f}")
         finally:
             client.close()
         return
 
     # --signals
     if args.signals:
-        from .scanner import compute_book_metrics, filter_tradeable, scan_markets
         from .signals import scan_for_signals
         try:
-            markets = scan_markets(client, limit=config.scan_limit)
-            for m in markets:
-                for tok in m.get("tokens", []):
-                    try:
-                        book = client.get_orderbook(tok["token_id"])
-                        tok["metrics"] = compute_book_metrics(book)
-                    except Exception:
-                        tok["metrics"] = {"liquidity_grade": "D"}
-                grades = [tok.get("metrics", {}).get("liquidity_grade", "D")
-                          for tok in m.get("tokens", [])]
-                m["liquidity_grade"] = min(grades, key=lambda g: "ABCD".index(g)) if grades else "D"
-            tradeable = filter_tradeable(markets, min_liquidity=config.min_liquidity_grade)
-            token_ids = [tok["token_id"] for m in tradeable for tok in m.get("tokens", [])]
-            signals = scan_for_signals(client, token_ids, config)
+            tradeable, mc_groups, token_ids, token_prices, token_pairs = run_scan_pipeline(client, config)
+            signals = scan_for_signals(
+                client, token_ids, config,
+                multi_choice_groups=mc_groups,
+                token_prices=token_prices,
+                token_pairs=token_pairs,
+            )
             if not signals:
                 print("No signals detected.")
             else:
-                print(f"{'Side':<5} {'Token':<18} {'Price':>6} {'Edge':>6} {'Method':<16} {'Conf':>5}")
-                print("-" * 60)
+                print(f"{'Side':<5} {'Token':<18} {'Price':>6} {'Edge':>6} {'Method':<20} {'Conf':>5}")
+                print("-" * 64)
                 for s in signals:
                     print(
                         f"  {s.side:<4} {s.token_id[:16]:<18} {s.market_price:>5.3f} "
-                        f"{s.edge:>6.4f} {s.method:<16} {s.confidence:>5.2f}"
+                        f"{s.edge:>6.4f} {s.method:<20} {s.confidence:>5.2f}"
                     )
                 print(f"\n{len(signals)} signal(s)")
         finally:
@@ -251,13 +252,14 @@ def main() -> None:
         logger.info("DRY RUN — no trades will be executed")
 
     try:
-        run_strategy(
-            client=client,
-            config=config,
-            state=state,
-            dry_run=dry_run,
-            state_path=state_path,
-        )
+        with state_lock(state_path):
+            run_strategy(
+                client=client,
+                config=config,
+                state=state,
+                dry_run=dry_run,
+                state_path=state_path,
+            )
     finally:
         client.close()
 

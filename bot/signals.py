@@ -1,16 +1,19 @@
-"""Edge detection via three independent methods.
+"""Edge detection via four independent methods.
 
 1. **Longshot bias** — empirical mispricing at price extremes (Becker 2024).
 2. **Arbitrage** — YES + NO orderbook violations of the $1 invariant.
 3. **Microstructure** — order-book imbalance and spread analysis.
+4. **Multi-choice arbitrage** — sum of YES prices across grouped markets ≠ $1.
 
 Each method returns a Signal dataclass (or None) when an edge is detected.
-The orchestrator ``scan_for_signals`` runs all three on each token.
+The orchestrator ``scan_for_signals`` runs methods 1-3 on each token.
+Method 4 operates on multi-choice groups detected by the Gamma API.
 """
 
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -215,43 +218,180 @@ def detect_microstructure_edge(
     )
 
 
+# ── Method 4: Multi-choice arbitrage ──────────────────────────────────
+
+def detect_multi_choice_arbitrage(
+    group,  # MultiChoiceGroup from gamma.py
+    min_edge_bps: int = 20,
+    fee_rate: float = 0.0,
+) -> list[Signal]:
+    """Detect arbitrage in multi-choice markets (Gamma API groups).
+
+    Multi-choice events on Polymarket are N binary markets whose YES
+    prices should sum to $1.00.  Deviations create arbitrage:
+
+    * sum < 1.0 → buy all YES outcomes = guaranteed profit
+    * sum > 1.0 → sell all YES (buy NOs) = guaranteed profit
+
+    *fee_rate* is subtracted from edge_per_outcome (e.g. 0.02 for 2%).
+    Returns a list of Signals (one per outcome to trade).
+    """
+    if abs(group.deviation) * 10_000 < min_edge_bps:
+        return []
+
+    n = len(group.markets)
+    if n < 2:
+        return []
+
+    edge_per_outcome = abs(group.deviation) / n
+    net_edge = edge_per_outcome - fee_rate
+    if net_edge <= 0:
+        return []
+    edge_per_outcome = net_edge
+    signals: list[Signal] = []
+
+    if group.deviation < 0:
+        # Sum < 1.0 → buy all YES tokens
+        for m in group.markets:
+            if not m.clob_token_ids or not m.outcome_prices:
+                continue
+            yes_token = m.clob_token_ids[0]  # first token = YES
+            yes_price = m.outcome_prices[0]
+            signals.append(Signal(
+                token_id=yes_token,
+                side="BUY",
+                fair_value=yes_price + edge_per_outcome,
+                market_price=yes_price,
+                edge=edge_per_outcome,
+                method="multi_choice_arb",
+                confidence=min(1.0, abs(group.deviation) / 0.02),
+                meta={
+                    "type": "buy_all_yes",
+                    "event_id": group.event_id,
+                    "event_title": group.event_title,
+                    "yes_sum": group.yes_sum,
+                    "deviation": group.deviation,
+                    "n_outcomes": n,
+                    "group_item": m.group_item_title,
+                    "question": m.question,
+                },
+            ))
+    else:
+        # Sum > 1.0 → sell all YES (buy NO tokens)
+        for m in group.markets:
+            if len(m.clob_token_ids) < 2 or not m.outcome_prices:
+                continue
+            no_token = m.clob_token_ids[1]  # second token = NO
+            yes_price = m.outcome_prices[0]
+            no_price = m.outcome_prices[1] if len(m.outcome_prices) > 1 else 1.0 - yes_price
+            signals.append(Signal(
+                token_id=no_token,
+                side="BUY",
+                fair_value=no_price + edge_per_outcome,
+                market_price=no_price,
+                edge=edge_per_outcome,
+                method="multi_choice_arb",
+                confidence=min(1.0, abs(group.deviation) / 0.02),
+                meta={
+                    "type": "buy_all_no",
+                    "event_id": group.event_id,
+                    "event_title": group.event_title,
+                    "yes_sum": group.yes_sum,
+                    "deviation": group.deviation,
+                    "n_outcomes": n,
+                    "group_item": m.group_item_title,
+                    "question": m.question,
+                },
+            ))
+
+    logger.info(
+        "Multi-choice arb: %s — %d outcomes, yes_sum=%.4f, dev=%.4f, %d signals",
+        group.event_title[:40], n, group.yes_sum, group.deviation, len(signals),
+    )
+    return signals
+
+
 # ── Orchestrator ─────────────────────────────────────────────────────────
 
 def scan_for_signals(
     client: PolymarketClient, token_ids: list[str], config: Config,
+    multi_choice_groups: list | None = None,
+    token_prices: dict[str, float] | None = None,
+    token_pairs: dict[str, tuple[str, str]] | None = None,
 ) -> list[Signal]:
-    """Run all detection methods on each token and return sorted signals."""
+    """Run all detection methods on each token and return sorted signals.
+
+    Methods 1-3 operate on individual tokens.
+    Method 4 (multi-choice arbitrage) operates on groups from Gamma API.
+
+    *token_prices* can supply pre-fetched prices (e.g. from Gamma API)
+    to avoid redundant CLOB /price calls.
+
+    *token_pairs* maps condition_id → (yes_token_id, no_token_id) for
+    binary arbitrage detection (method 2).
+    """
     signals: list[Signal] = []
+    prices_cache = dict(token_prices or {})
 
-    for tid in token_ids:
-        try:
-            price_info = client.get_price(tid)
-            price = float(price_info.get("price", 0))
-        except Exception:
-            logger.debug("Failed to get price for %s, skipping", tid[:16])
-            continue
-
-        # Method 1: Longshot bias
-        if config.longshot_bias:
-            sig = detect_longshot_bias(tid, price, min_edge=config.min_ev_threshold)
-            if sig:
-                signals.append(sig)
-
-        # Method 2: Arbitrage (needs both YES/NO books — skip for individual tokens)
-        # Arbitrage is handled separately in strategy via paired tokens
-
-        # Method 3: Microstructure
+    # Fetch price + book data in parallel for all tokens
+    def _fetch_token_data(tid):
+        price = prices_cache.get(tid)
+        if price is None:
+            try:
+                price = float(client.get_price(tid).get("price", 0))
+            except Exception:
+                logger.debug("Failed to get price for %s, skipping", tid[:16])
+                return tid, None, None
+        book = None
         if config.microstructure:
             try:
                 book = client.get_orderbook(tid)
                 book["asset_id"] = tid
-                sig = detect_microstructure_edge(
-                    book, imbalance_threshold=config.imbalance_threshold,
-                )
-                if sig and sig.edge >= config.min_ev_threshold:
-                    signals.append(sig)
             except Exception:
                 logger.debug("Failed to get book for %s, skipping", tid[:16])
+        return tid, price, book
+
+    with ThreadPoolExecutor(max_workers=config.parallel_workers) as pool:
+        results = list(pool.map(_fetch_token_data, token_ids))
+
+    for tid, price, book in results:
+        if price is None:
+            continue
+
+        # Method 1: Longshot bias (uses separate threshold)
+        if config.longshot_bias:
+            sig = detect_longshot_bias(tid, price, min_edge=config.longshot_min_edge)
+            if sig:
+                signals.append(sig)
+
+        # Method 3: Microstructure
+        if config.microstructure and book is not None:
+            sig = detect_microstructure_edge(
+                book, imbalance_threshold=config.imbalance_threshold,
+            )
+            if sig and sig.edge >= config.min_ev_threshold:
+                signals.append(sig)
+
+    # Method 2: YES/NO arbitrage (via token_pairs)
+    if config.arbitrage and token_pairs:
+        for cid, (yes_tid, no_tid) in token_pairs.items():
+            try:
+                book_yes = client.get_orderbook(yes_tid)
+                book_yes["asset_id"] = yes_tid
+                book_no = client.get_orderbook(no_tid)
+                book_no["asset_id"] = no_tid
+                sig = detect_arbitrage(book_yes, book_no)
+                if sig:
+                    signals.append(sig)
+            except Exception:
+                logger.debug("Failed to get arb books for %s, skipping", cid[:16])
+
+    # Method 4: Multi-choice arbitrage (from Gamma groups)
+    fee_rate = config.polymarket_fee_bps / 10_000
+    if config.multi_choice_arbitrage and multi_choice_groups:
+        for group in multi_choice_groups:
+            mc_signals = detect_multi_choice_arbitrage(group, fee_rate=fee_rate)
+            signals.extend(mc_signals)
 
     # Sort by edge * confidence descending
     signals.sort(key=lambda s: s.edge * s.confidence, reverse=True)

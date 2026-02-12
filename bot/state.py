@@ -1,5 +1,7 @@
 """Persistent trading state between runs."""
 
+import contextlib
+import fcntl
 import json
 import logging
 import os
@@ -22,6 +24,8 @@ class TradeRecord:
     neg_risk: bool = False
     timestamp: str = ""
     memo: str = ""
+    end_date: str = ""
+    condition_id: str = ""
 
     def to_dict(self) -> dict:
         return self.__dict__.copy()
@@ -87,6 +91,23 @@ class TradingState:
             "n": len(preds),
         }
 
+    # ── Closed trade history ─────────────────────────────────────────
+
+    def record_closed_trade(
+        self, trade: "TradeRecord", exit_price: float, pnl: float,
+    ) -> None:
+        """Append a closed trade to pnl_history."""
+        self.pnl_history.append({
+            "market_id": trade.market_id,
+            "token_id": trade.token_id,
+            "side": trade.side,
+            "entry_price": trade.price,
+            "exit_price": exit_price,
+            "size": trade.size,
+            "pnl": round(pnl, 4),
+            "closed_at": datetime.now(timezone.utc).isoformat(),
+        })
+
     # ── Daily PnL tracking ───────────────────────────────────────────
 
     def record_daily_pnl(self, amount: float) -> None:
@@ -142,3 +163,23 @@ class TradingState:
         except (json.JSONDecodeError, IOError, KeyError) as exc:
             logger.warning("Failed to load state from %s: %s — starting fresh", path, exc)
             return cls()
+
+
+@contextlib.contextmanager
+def state_lock(state_path: str):
+    """Exclusive file lock around state access (fcntl.flock, LOCK_EX | LOCK_NB).
+
+    Prevents concurrent bot runs from corrupting state.
+    """
+    lock_path = state_path + ".lock"
+    fd = open(lock_path, "w")
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        logger.debug("Acquired state lock: %s", lock_path)
+        yield
+    except OSError:
+        logger.error("Failed to acquire state lock — another instance running?")
+        raise
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        fd.close()

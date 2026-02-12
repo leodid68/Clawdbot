@@ -1,8 +1,9 @@
-"""Tests for bot.scanner — market scanning and filtering."""
+"""Tests for bot.scanner — market scanning, filtering, and pipeline."""
 
 import unittest
 
-from bot.scanner import compute_book_metrics, filter_tradeable, scan_markets
+from bot.scanner import compute_book_metrics, filter_tradeable, run_scan_pipeline, scan_markets
+from bot.config import Config
 
 
 class TestComputeBookMetrics(unittest.TestCase):
@@ -109,6 +110,87 @@ class TestScanMarkets(unittest.TestCase):
         result = scan_markets(FakeClient())
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0]["condition_id"], "c1")
+
+
+class TestRunScanPipeline(unittest.TestCase):
+    """Tests for the shared run_scan_pipeline."""
+
+    def test_pipeline_returns_correct_structure(self):
+        """Pipeline should return 5-tuple with correct types."""
+        config = Config(use_gamma=False, min_liquidity_grade="D")
+
+        class FakeClient:
+            def get_markets(self, **kw):
+                return [
+                    {
+                        "condition_id": "c1", "question": "Q1",
+                        "tokens": [
+                            {"token_id": "t_yes", "outcome": "Yes"},
+                            {"token_id": "t_no", "outcome": "No"},
+                        ],
+                        "accepting_orders": True, "enable_order_book": True,
+                    },
+                ]
+            def get_orderbook(self, tid):
+                return {
+                    "bids": [{"price": "0.50", "size": "100"}],
+                    "asks": [{"price": "0.52", "size": "100"}],
+                }
+
+        tradeable, mc_groups, token_ids, token_prices, token_pairs = run_scan_pipeline(
+            FakeClient(), config,
+        )
+        self.assertIsInstance(tradeable, list)
+        self.assertIsInstance(mc_groups, list)
+        self.assertIsInstance(token_ids, list)
+        self.assertIsInstance(token_prices, dict)
+        self.assertIsInstance(token_pairs, dict)
+
+    def test_pipeline_extracts_token_ids(self):
+        config = Config(use_gamma=False, min_liquidity_grade="D")
+
+        class FakeClient:
+            def get_markets(self, **kw):
+                return [
+                    {
+                        "condition_id": "c1", "question": "Q1",
+                        "tokens": [
+                            {"token_id": "t_yes", "outcome": "Yes", "price": 0.6},
+                            {"token_id": "t_no", "outcome": "No", "price": 0.4},
+                        ],
+                        "accepting_orders": True, "enable_order_book": True,
+                    },
+                ]
+            def get_orderbook(self, tid):
+                return {
+                    "bids": [{"price": "0.50", "size": "100"}],
+                    "asks": [{"price": "0.52", "size": "100"}],
+                }
+
+        _, _, token_ids, token_prices, token_pairs = run_scan_pipeline(
+            FakeClient(), config,
+        )
+        self.assertIn("t_yes", token_ids)
+        self.assertIn("t_no", token_ids)
+        self.assertAlmostEqual(token_prices.get("t_yes"), 0.6)
+        self.assertIn("c1", token_pairs)
+        self.assertEqual(token_pairs["c1"], ("t_yes", "t_no"))
+
+    def test_pipeline_empty_markets(self):
+        config = Config(use_gamma=False, min_liquidity_grade="D")
+
+        class FakeClient:
+            def get_markets(self, **kw):
+                return []
+            def get_orderbook(self, tid):
+                return {"bids": [], "asks": []}
+
+        tradeable, mc_groups, token_ids, token_prices, token_pairs = run_scan_pipeline(
+            FakeClient(), config,
+        )
+        self.assertEqual(len(tradeable), 0)
+        self.assertEqual(len(token_ids), 0)
+        self.assertEqual(len(token_pairs), 0)
 
 
 if __name__ == "__main__":

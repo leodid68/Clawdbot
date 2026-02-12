@@ -43,9 +43,27 @@ class Config:
     microstructure: bool = True
     imbalance_threshold: float = 0.30
 
+    # Multi-choice
+    multi_choice_arbitrage: bool = True
+    polymarket_fee_bps: int = 200        # Polymarket fees ~2%
+
+    # Stop-loss
+    stop_loss_pct: float = 0.50          # exit if loss > 50%
+
+    # Longshot bias
+    longshot_min_edge: float = 0.005     # separate threshold for longshot bias
+
+    # Parallelism
+    parallel_workers: int = 10           # ThreadPoolExecutor workers
+
     # Scanning
     min_liquidity_grade: str = "C"
-    scan_limit: int = 50
+    scan_limit: int = 100
+
+    # Gamma API
+    use_gamma: bool = True
+    gamma_min_volume: float = 1000.0
+    gamma_min_liquidity: float = 100.0
 
     # State
     state_file: str = "state.json"

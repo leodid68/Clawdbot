@@ -4,26 +4,33 @@ One main function called once per run, no internal loop.
 Schedule with cron or OpenClaw for periodic execution.
 
 Pipeline:
-    1. scanner.scan_markets()        → candidate markets
-    2. scanner.filter_tradeable()    → liquidity filter
-    3. signals.scan_for_signals()    → edge detection (3 methods)
-    4. For each signal:
+    1. Check exits on open positions (stop-loss, take-profit BUY/SELL)
+    2. scanner.scan_markets_gamma()  → candidate markets + multi-choice groups
+       (falls back to CLOB scan if Gamma unavailable)
+    3. scanner.filter_tradeable()    → liquidity filter
+    4. signals.scan_for_signals()    → edge detection (4 methods)
+    5. For each signal:
        a. sizing.check_risk_limits() → verify limits
-       b. sizing.position_size()     → Kelly sizing
+       b. sizing.position_size()     → Kelly sizing (BUY + SELL)
        c. client.post_order()        → execute (if --live)
        d. state.record_trade()       → persist
        e. state.record_prediction()  → calibration tracking
-    5. Check exits on open positions
-    6. state.save()
-    7. Log calibration stats
+    6. Resolve pending predictions (via Gamma)
+    7. state.save()
+    8. Log calibration stats
 """
 
 import logging
-
-from polymarket.client import PolymarketClient
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 
 from .config import Config
-from .scanner import compute_book_metrics, filter_tradeable, scan_markets
+from .scanner import (
+    compute_book_metrics,
+    filter_tradeable,
+    scan_markets,
+    scan_markets_gamma,
+)
 from .signals import scan_for_signals
 from .sizing import check_risk_limits, dynamic_exit_threshold, position_size
 from .state import TradingState
@@ -31,8 +38,67 @@ from .state import TradingState
 logger = logging.getLogger(__name__)
 
 
+# ── Helpers ────────────────────────────────────────────────────────────
+
+def _compute_pnl(pos, current_price: float) -> float:
+    """Compute unrealized PnL for a position (BUY or SELL)."""
+    if pos.side == "BUY":
+        return (current_price - pos.price) * pos.size
+    else:
+        return (pos.price - current_price) * pos.size
+
+
+def _compute_hours_to_resolution(end_date_str: str) -> float:
+    """Parse ISO end_date → hours remaining until resolution."""
+    if not end_date_str:
+        return 48.0  # fallback
+    try:
+        end_dt = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+        now = datetime.now(timezone.utc)
+        delta = end_dt - now
+        hours = delta.total_seconds() / 3600.0
+        return max(0.0, hours)
+    except (ValueError, TypeError):
+        return 48.0
+
+
+def _find_end_date(markets: list[dict], token_id: str) -> str:
+    """Look up end_date_iso for a token from the market list."""
+    for m in markets:
+        for tok in m.get("tokens", []):
+            if tok.get("token_id") == token_id:
+                return m.get("end_date_iso", "")
+    return ""
+
+
+def _find_condition_id(markets: list[dict], token_id: str) -> str:
+    for m in markets:
+        for tok in m.get("tokens", []):
+            if tok.get("token_id") == token_id:
+                return m.get("condition_id", "")
+    return ""
+
+
+def _build_token_pairs(tradeable: list[dict]) -> dict[str, tuple[str, str]]:
+    """Build condition_id → (yes_token_id, no_token_id) map for binary markets."""
+    pairs: dict[str, tuple[str, str]] = {}
+    for m in tradeable:
+        tokens = m.get("tokens", [])
+        cid = m.get("condition_id", "")
+        if not cid or len(tokens) < 2:
+            continue
+        # Binary market: first token = YES, second = NO
+        yes_tid = tokens[0].get("token_id", "")
+        no_tid = tokens[1].get("token_id", "")
+        if yes_tid and no_tid:
+            pairs[cid] = (yes_tid, no_tid)
+    return pairs
+
+
+# ── Main strategy ──────────────────────────────────────────────────────
+
 def run_strategy(
-    client: PolymarketClient,
+    client,
     config: Config,
     state: TradingState,
     dry_run: bool = True,
@@ -45,20 +111,65 @@ def run_strategy(
     positions = state.open_positions()
     logger.info("Open positions: %d", len(positions))
 
+    # Fetch current prices in parallel
+    price_map: dict[str, float] = {}
+    if positions:
+        def _get_price(pos):
+            try:
+                info = client.get_price(pos.token_id)
+                return pos, float(info.get("price", 0))
+            except Exception:
+                logger.warning("Failed to get price for %s, skipping exit check", pos.token_id[:16])
+                return pos, None
+
+        with ThreadPoolExecutor(max_workers=config.parallel_workers) as pool:
+            futures = {pool.submit(_get_price, pos): pos for pos in positions}
+            for future in as_completed(futures):
+                pos, current = future.result()
+                if current is None:
+                    continue
+                price_map[pos.token_id] = current
+
     for pos in positions:
-        try:
-            price_info = client.get_price(pos.token_id)
-            current = float(price_info.get("price", 0))
-        except Exception:
-            logger.warning("Failed to get price for %s, skipping exit check", pos.token_id[:16])
+        current = price_map.get(pos.token_id)
+        if current is None:
             continue
 
-        threshold = dynamic_exit_threshold(pos.price, hours_to_resolution=48)
+        # Stop-loss check
+        if pos.side == "BUY":
+            loss_pct = (pos.price - current) / pos.price if pos.price > 0 else 0
+        else:
+            loss_pct = (current - pos.price) / (1.0 - pos.price) if pos.price < 1.0 else 0
 
-        if current >= threshold and pos.side == "BUY":
-            pnl = (current - pos.price) * pos.size
+        if loss_pct >= config.stop_loss_pct:
+            pnl = _compute_pnl(pos, current)
             logger.info(
-                "EXIT: %s @ %.4f (entry %.4f, pnl $%.2f)",
+                "STOP-LOSS: %s %s @ %.4f (entry %.4f, loss %.0f%%, pnl $%.2f)",
+                pos.side, pos.token_id[:16], current, pos.price, loss_pct * 100, pnl,
+            )
+            if not dry_run:
+                try:
+                    exit_side = "SELL" if pos.side == "BUY" else "BUY"
+                    client.post_order(
+                        pos.token_id, exit_side, current, pos.size,
+                        neg_risk=pos.neg_risk,
+                    )
+                    state.record_daily_pnl(pnl)
+                    state.record_closed_trade(pos, current, pnl)
+                    state.remove_trade(pos.market_id)
+                except Exception as exc:
+                    logger.error("Stop-loss order failed: %s", exc)
+            continue
+
+        # Dynamic exit threshold
+        hours = _compute_hours_to_resolution(pos.end_date)
+        threshold = dynamic_exit_threshold(pos.price, hours_to_resolution=hours)
+
+        # Take-profit: BUY exit
+        if current >= threshold and pos.side == "BUY":
+            pnl = _compute_pnl(pos, current)
+            logger.info(
+                "EXIT BUY: %s @ %.4f (entry %.4f, pnl $%.2f)",
                 pos.token_id[:16], current, pos.price, pnl,
             )
             if not dry_run:
@@ -68,41 +179,79 @@ def run_strategy(
                         neg_risk=pos.neg_risk,
                     )
                     state.record_daily_pnl(pnl)
+                    state.record_closed_trade(pos, current, pnl)
                     state.remove_trade(pos.market_id)
                 except Exception as exc:
                     logger.error("Exit order failed: %s", exc)
 
-    # ── 2. Scan markets ──────────────────────────────────────────────
-    try:
-        raw_markets = scan_markets(client, limit=config.scan_limit)
-    except Exception as exc:
-        logger.error("Market scan failed: %s", exc)
-        state.save(state_path)
-        return
+        # Take-profit: SELL exit (price dropped below threshold)
+        elif current <= (1.0 - threshold) and pos.side == "SELL":
+            pnl = _compute_pnl(pos, current)
+            logger.info(
+                "EXIT SELL: %s @ %.4f (entry %.4f, pnl $%.2f)",
+                pos.token_id[:16], current, pos.price, pnl,
+            )
+            if not dry_run:
+                try:
+                    client.post_order(
+                        pos.token_id, "BUY", current, pos.size,
+                        neg_risk=pos.neg_risk,
+                    )
+                    state.record_daily_pnl(pnl)
+                    state.record_closed_trade(pos, current, pnl)
+                    state.remove_trade(pos.market_id)
+                except Exception as exc:
+                    logger.error("Exit order failed: %s", exc)
 
-    # ── 3. Compute book metrics and filter ───────────────────────────
-    for m in raw_markets:
-        best_grade = "D"
-        for tok in m.get("tokens", []):
-            try:
-                book = client.get_orderbook(tok["token_id"])
-                metrics = compute_book_metrics(book)
-                tok["metrics"] = metrics
-                if _grade_rank(metrics["liquidity_grade"]) < _grade_rank(best_grade):
-                    best_grade = metrics["liquidity_grade"]
-            except Exception:
-                tok["metrics"] = {"liquidity_grade": "D"}
-        m["liquidity_grade"] = best_grade
+    # ── 2. Scan markets (Gamma preferred, CLOB fallback) ─────────────
+    multi_choice_groups = []
 
+    if config.use_gamma:
+        try:
+            raw_markets, multi_choice_groups = scan_markets_gamma(config)
+            logger.info(
+                "Gamma: %d markets, %d multi-choice groups",
+                len(raw_markets), len(multi_choice_groups),
+            )
+        except Exception as exc:
+            logger.warning("Gamma scan failed (%s), falling back to CLOB", exc)
+            raw_markets = _scan_with_clob(client, config)
+    else:
+        raw_markets = _scan_with_clob(client, config)
+
+    # ── 3. Filter by liquidity ───────────────────────────────────────
     tradeable = filter_tradeable(raw_markets, min_liquidity=config.min_liquidity_grade)
+
+    # For CLOB-discovered markets without Gamma grades, compute book metrics
+    for m in tradeable:
+        if "gamma" not in m:
+            for tok in m.get("tokens", []):
+                if "metrics" not in tok:
+                    try:
+                        book = client.get_orderbook(tok["token_id"])
+                        tok["metrics"] = compute_book_metrics(book)
+                    except Exception:
+                        tok["metrics"] = {"liquidity_grade": "D"}
 
     # ── 4. Detect signals ────────────────────────────────────────────
     token_ids = []
+    token_prices: dict[str, float] = {}
     for m in tradeable:
         for tok in m.get("tokens", []):
             token_ids.append(tok["token_id"])
+            # Use Gamma price if available (avoids CLOB /price 400 errors)
+            if tok.get("price"):
+                token_prices[tok["token_id"]] = float(tok["price"])
 
-    signals = scan_for_signals(client, token_ids, config)
+    # Build token pairs for binary arbitrage
+    token_pairs = _build_token_pairs(tradeable)
+
+    signals = scan_for_signals(
+        client, token_ids, config,
+        multi_choice_groups=multi_choice_groups,
+        token_prices=token_prices,
+        token_pairs=token_pairs,
+    )
     logger.info("Signals detected: %d", len(signals))
 
     # ── 5. Execute on signals ────────────────────────────────────────
@@ -117,17 +266,21 @@ def run_strategy(
             bankroll=config.max_total_exposure,
             max_position=config.max_position_usd,
             kelly_frac=config.kelly_fraction,
+            side=sig.side,
         )
         if size_usd <= 0:
             continue
 
-        allowed, reason = check_risk_limits(state, config, size_usd)
+        allowed, reason = check_risk_limits(
+            state, config, size_usd, current_prices=price_map,
+        )
         if not allowed:
             logger.info("Risk limit: %s — skipping %s", reason, sig.token_id[:16])
             continue
 
-        # Find the condition_id for this token
+        # Find the condition_id and end_date for this token
         condition_id = _find_condition_id(tradeable, sig.token_id)
+        end_date = _find_end_date(tradeable, sig.token_id)
 
         logger.info(
             "TRADE: %s %s @ %.4f, size=$%.2f, edge=%.4f [%s]",
@@ -148,6 +301,8 @@ def run_strategy(
                     price=sig.market_price,
                     size=shares,
                     order_id=result.get("orderID", ""),
+                    end_date=end_date,
+                    condition_id=condition_id,
                 )
             except Exception as exc:
                 logger.error("Order failed: %s", exc)
@@ -160,6 +315,8 @@ def run_strategy(
                 price=sig.market_price,
                 size=size_usd / sig.market_price if sig.market_price > 0 else 0,
                 memo="dry_run",
+                end_date=end_date,
+                condition_id=condition_id,
             )
 
         state.record_prediction(
@@ -169,7 +326,15 @@ def run_strategy(
 
     logger.info("Trades this run: %d (max %d)", trades_this_run, config.max_trades_per_run)
 
-    # ── 6. Log calibration ───────────────────────────────────────────
+    # ── 6. Resolve pending predictions (via Gamma) ────────────────────
+    try:
+        from .gamma import GammaClient, resolve_pending_predictions
+        with GammaClient() as gamma:
+            resolve_pending_predictions(state, gamma)
+    except Exception as exc:
+        logger.debug("Prediction resolution skipped: %s", exc)
+
+    # ── 7. Log calibration ───────────────────────────────────────────
     cal = state.get_calibration()
     if cal["n"] > 0:
         logger.info(
@@ -177,18 +342,49 @@ def run_strategy(
             cal["brier"], cal["log"], cal["n"],
         )
 
-    # ── 7. Persist state ─────────────────────────────────────────────
+    # ── 8. Persist state ─────────────────────────────────────────────
     state.save(state_path)
     logger.info("Done.")
 
 
+def _scan_with_clob(client, config: Config) -> list[dict]:
+    """CLOB-based scan with book metrics computation."""
+    try:
+        raw_markets = scan_markets(client, limit=config.scan_limit)
+    except Exception as exc:
+        logger.error("CLOB scan failed: %s", exc)
+        return []
+
+    # Fetch order books in parallel
+    tokens_to_fetch = []
+    for m in raw_markets:
+        for tok in m.get("tokens", []):
+            tokens_to_fetch.append((m, tok))
+
+    def _fetch_book(item):
+        m, tok = item
+        try:
+            book = client.get_orderbook(tok["token_id"])
+            return m, tok, compute_book_metrics(book)
+        except Exception:
+            return m, tok, {"liquidity_grade": "D"}
+
+    with ThreadPoolExecutor(max_workers=config.parallel_workers) as pool:
+        results = list(pool.map(_fetch_book, tokens_to_fetch))
+
+    for m, tok, metrics in results:
+        tok["metrics"] = metrics
+
+    for m in raw_markets:
+        best_grade = "D"
+        for tok in m.get("tokens", []):
+            grade = tok.get("metrics", {}).get("liquidity_grade", "D")
+            if _grade_rank(grade) < _grade_rank(best_grade):
+                best_grade = grade
+        m["liquidity_grade"] = best_grade
+
+    return raw_markets
+
+
 def _grade_rank(grade: str) -> int:
     return {"A": 0, "B": 1, "C": 2, "D": 3}.get(grade, 3)
-
-
-def _find_condition_id(markets: list[dict], token_id: str) -> str:
-    for m in markets:
-        for tok in m.get("tokens", []):
-            if tok.get("token_id") == token_id:
-                return m.get("condition_id", "")
-    return ""

@@ -43,6 +43,35 @@ class TestKellyFraction(unittest.TestCase):
     def test_boundary_prob_one(self):
         self.assertEqual(kelly_fraction(1.0, 0.5), 0.0)
 
+    # ── SELL Kelly tests ──
+
+    def test_sell_positive_edge(self):
+        # price=0.6, p=0.4 → f* = (0.6 - 0.4) / 0.6 = 0.333
+        frac = kelly_fraction(0.4, 0.6, fraction=1.0, side="SELL")
+        self.assertAlmostEqual(frac, 1 / 3, places=3)
+
+    def test_sell_no_edge(self):
+        # price=0.5, p=0.5 → f* = 0
+        frac = kelly_fraction(0.5, 0.5, side="SELL")
+        self.assertEqual(frac, 0.0)
+
+    def test_sell_negative_edge(self):
+        # price=0.4, p=0.6 → f* = (0.4 - 0.6) / 0.4 < 0 → 0
+        frac = kelly_fraction(0.6, 0.4, side="SELL")
+        self.assertEqual(frac, 0.0)
+
+    def test_sell_quarter_kelly(self):
+        # price=0.8, p=0.3 → f* = (0.8 - 0.3) / 0.8 = 0.625
+        # quarter: 0.625 * 0.25 = 0.15625
+        frac = kelly_fraction(0.3, 0.8, fraction=0.25, side="SELL")
+        self.assertAlmostEqual(frac, 0.15625)
+
+    def test_sell_boundary_zero(self):
+        self.assertEqual(kelly_fraction(0.5, 0.0, side="SELL"), 0.0)
+
+    def test_sell_boundary_one(self):
+        self.assertEqual(kelly_fraction(0.5, 1.0, side="SELL"), 0.0)
+
 
 class TestPositionSize(unittest.TestCase):
     def test_basic_sizing(self):
@@ -62,6 +91,16 @@ class TestPositionSize(unittest.TestCase):
     def test_caps_at_bankroll(self):
         size = position_size(0.9, 0.1, bankroll=10, max_position=100, kelly_frac=1.0)
         self.assertLessEqual(size, 10.0)
+
+    def test_sell_sizing(self):
+        # p=0.3, price=0.7 → SELL f* = (0.7-0.3)/0.7 ≈ 0.571
+        size = position_size(0.3, 0.7, bankroll=100, max_position=50, kelly_frac=1.0, side="SELL")
+        self.assertGreater(size, 0)
+        self.assertLessEqual(size, 50.0)
+
+    def test_sell_no_edge(self):
+        size = position_size(0.7, 0.5, bankroll=100, max_position=20, side="SELL")
+        self.assertEqual(size, 0.0)
 
 
 class TestDynamicExitThreshold(unittest.TestCase):
@@ -119,6 +158,42 @@ class TestCheckRiskLimits(unittest.TestCase):
         allowed, reason = check_risk_limits(state, config, 5.0)
         self.assertFalse(allowed)
         self.assertIn("daily", reason.lower())
+
+    # ── Unrealized PnL tests ──
+
+    def test_unrealized_pnl_triggers_loss_limit(self):
+        """Bug 5: unrealized losses should count toward daily loss limit."""
+        state = self._make_state(n_positions=1, today_pnl=0.0)
+        config = Config(max_daily_loss=3.0)
+        # Position: BUY at 0.5, size=10. Current price = 0.1 → unrealized = (0.1-0.5)*10 = -4
+        current_prices = {"t0": 0.1}
+        allowed, reason = check_risk_limits(state, config, 1.0, current_prices=current_prices)
+        self.assertFalse(allowed)
+        self.assertIn("daily", reason.lower())
+
+    def test_unrealized_pnl_sell_position(self):
+        """Unrealized PnL for SELL positions counted correctly."""
+        state = TradingState()
+        state.record_trade(
+            market_id="m0", token_id="t0", side="SELL", price=0.7, size=10,
+        )
+        config = Config(max_daily_loss=3.0)
+        # SELL at 0.7, current 0.9 → loss = (0.7-0.9)*10 = -2 (within limit)
+        current_prices = {"t0": 0.9}
+        allowed, _ = check_risk_limits(state, config, 1.0, current_prices=current_prices)
+        self.assertTrue(allowed)
+
+        # Now current 0.95 → loss = (0.7-0.95)*10 = -2.5 still under
+        current_prices = {"t0": 0.95}
+        allowed, _ = check_risk_limits(state, config, 1.0, current_prices=current_prices)
+        self.assertTrue(allowed)
+
+    def test_no_current_prices_no_crash(self):
+        """Passing None for current_prices should not crash."""
+        state = self._make_state(n_positions=1)
+        config = Config()
+        allowed, _ = check_risk_limits(state, config, 1.0, current_prices=None)
+        self.assertTrue(allowed)
 
 
 if __name__ == "__main__":
