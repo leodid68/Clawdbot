@@ -110,8 +110,15 @@ class GammaClient:
         limit: int = 50,
         active: bool = True,
         closed: bool = False,
+        tag_slug: str | None = None,
     ) -> list[dict]:
-        """Fetch events (groups of related markets)."""
+        """Fetch events (groups of related markets).
+
+        Use *tag_slug* to filter by tag (e.g. ``"weather"``).
+        Note: the ``tag=`` parameter is broken in the Gamma API — it gets
+        ignored and returns default results.  ``tag_slug`` is the correct
+        filter parameter.
+        """
         params: dict = {
             "limit": str(limit),
             "active": str(active).lower(),
@@ -119,12 +126,58 @@ class GammaClient:
             "order": "volume",
             "ascending": "false",
         }
+        if tag_slug:
+            params["tag_slug"] = tag_slug
         resp = self._http.get("/events", params=params)
         resp.raise_for_status()
         return resp.json()
 
-    def fetch_event_markets(self, event_id: str) -> list[GammaMarket]:
-        """Fetch ALL markets for a specific event (complete multi-choice group)."""
+    def fetch_weather_events(self, *, limit: int = 100) -> list[dict]:
+        """Fetch active weather/temperature events using tag_slug=weather.
+
+        Daily temperature markets have tags ['Weather', 'Recurring', 'Hide From New']
+        and are NOT returned by standard search/tag parameters.
+        """
+        return self.fetch_events(limit=limit, tag_slug="weather")
+
+    def fetch_events_with_markets(
+        self,
+        *,
+        tag_slug: str,
+        limit: int = 100,
+    ) -> tuple[list[dict], list[GammaMarket]]:
+        """Fetch events by tag_slug and parse embedded markets.
+
+        The ``/events`` endpoint embeds full market data in each event,
+        which is the only reliable way to get markets since the
+        ``event_id`` filter on ``/markets`` is broken.
+
+        Returns (events_raw, all_gamma_markets).
+        """
+        events = self.fetch_events(limit=limit, tag_slug=tag_slug)
+        all_markets: list[GammaMarket] = []
+        for ev in events:
+            event_id = str(ev.get("id", ""))
+            event_title = ev.get("title", "")
+            raw_markets = ev.get("markets") or []
+            for m in raw_markets:
+                gm = _parse_market(m)
+                gm.event_id = event_id
+                gm.event_title = event_title
+                all_markets.append(gm)
+        logger.info(
+            "Fetched %d markets from %d events (tag_slug=%s)",
+            len(all_markets), len(events), tag_slug,
+        )
+        return events, all_markets
+
+    def fetch_event_markets(self, event_id: str, event_title: str = "") -> list[GammaMarket]:
+        """Fetch ALL markets for a specific event (complete multi-choice group).
+
+        The Gamma API's nested ``events`` field is unreliable (returns
+        unrelated events), so we override ``event_id`` and ``event_title``
+        on the parsed markets with the known values.
+        """
         resp = self._http.get("/markets", params={
             "event_id": event_id,
             "closed": "false",
@@ -132,7 +185,13 @@ class GammaClient:
         })
         resp.raise_for_status()
         raw = resp.json()
-        return [_parse_market(m) for m in raw]
+        markets = [_parse_market(m) for m in raw]
+        # Override event_id/title since the API's nested events field is broken
+        for gm in markets:
+            gm.event_id = event_id
+            if event_title:
+                gm.event_title = event_title
+        return markets
 
     def check_resolution(self, condition_id: str) -> dict | None:
         """Check if a market is resolved via Gamma API.

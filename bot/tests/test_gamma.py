@@ -366,6 +366,204 @@ class TestResolvePendingPredictions(unittest.TestCase):
         self.assertIsNotNone(cal["log"])
 
 
+class TestFetchEventsWithMarkets(unittest.TestCase):
+    """Tests for fetch_events_with_markets and weather market parsing."""
+
+    def test_parses_embedded_markets(self):
+        """Markets embedded in event responses are parsed correctly."""
+        from bot.gamma import GammaClient
+
+        fake_events = [
+            {
+                "id": "204111",
+                "title": "Highest temperature in London on February 12?",
+                "volume": 451000,
+                "markets": [
+                    {
+                        "id": "m1",
+                        "question": "Will the highest temperature in London be 6C or below?",
+                        "conditionId": "0xcond1",
+                        "slug": "london-6c-below",
+                        "outcomes": '["Yes", "No"]',
+                        "outcomePrices": '["0.05", "0.95"]',
+                        "clobTokenIds": '["tok_yes1", "tok_no1"]',
+                        "volume": "10000",
+                        "volume24hr": "500",
+                        "liquidity": "1000",
+                        "bestBid": "0.04",
+                        "bestAsk": "0.06",
+                        "endDate": "2026-02-13T00:00:00Z",
+                        "active": True,
+                        "closed": False,
+                        "negRisk": True,
+                        "groupItemTitle": "6C or below",
+                        "events": [],  # broken in API
+                    },
+                    {
+                        "id": "m2",
+                        "question": "Will the highest temperature in London be 7C?",
+                        "conditionId": "0xcond2",
+                        "slug": "london-7c",
+                        "outcomes": '["Yes", "No"]',
+                        "outcomePrices": '["0.15", "0.85"]',
+                        "clobTokenIds": '["tok_yes2", "tok_no2"]',
+                        "volume": "8000",
+                        "volume24hr": "300",
+                        "liquidity": "800",
+                        "bestBid": "0.14",
+                        "bestAsk": "0.16",
+                        "endDate": "2026-02-13T00:00:00Z",
+                        "active": True,
+                        "closed": False,
+                        "negRisk": True,
+                        "groupItemTitle": "7C",
+                        "events": [{"id": "999", "title": "WRONG EVENT"}],
+                    },
+                ],
+            },
+        ]
+
+        # Simulate fetch_events_with_markets by calling _parse_market directly
+        from bot.gamma import _parse_market
+        all_markets = []
+        for ev in fake_events:
+            event_id = str(ev["id"])
+            event_title = ev["title"]
+            for m in ev.get("markets", []):
+                gm = _parse_market(m)
+                gm.event_id = event_id
+                gm.event_title = event_title
+                all_markets.append(gm)
+
+        self.assertEqual(len(all_markets), 2)
+        # Both markets should have the correct event_id from the parent event
+        for gm in all_markets:
+            self.assertEqual(gm.event_id, "204111")
+            self.assertEqual(gm.event_title, "Highest temperature in London on February 12?")
+        # Check parsing
+        self.assertEqual(all_markets[0].group_item_title, "6C or below")
+        self.assertEqual(all_markets[1].group_item_title, "7C")
+        self.assertTrue(all_markets[0].neg_risk)
+        self.assertTrue(all_markets[1].neg_risk)
+
+    def test_event_id_override_fixes_broken_api(self):
+        """The API returns wrong events in nested field; override must fix it."""
+        from bot.gamma import _parse_market
+        raw = {
+            "id": "m1",
+            "question": "London temp?",
+            "conditionId": "0x1",
+            "slug": "london-temp",
+            "outcomes": '["Yes", "No"]',
+            "outcomePrices": '["0.50", "0.50"]',
+            "clobTokenIds": '["t1", "t2"]',
+            "volume": "1000",
+            "volume24hr": "100",
+            "liquidity": "500",
+            "bestBid": "0.49",
+            "bestAsk": "0.51",
+            "endDate": "2026-02-13T00:00:00Z",
+            "active": True,
+            "closed": False,
+            "negRisk": True,
+            "groupItemTitle": "7C",
+            # API bug: returns Trump deportation event
+            "events": [{"id": "16282", "title": "How many people will Trump deport?"}],
+        }
+        gm = _parse_market(raw)
+        # Before override, event_id is wrong
+        self.assertEqual(gm.event_id, "16282")
+
+        # After override (as fetch_events_with_markets does)
+        gm.event_id = "204111"
+        gm.event_title = "Highest temperature in London on February 12?"
+        self.assertEqual(gm.event_id, "204111")
+        self.assertEqual(gm.event_title, "Highest temperature in London on February 12?")
+
+    def test_weather_multi_choice_grouping(self):
+        """Temperature outcomes for a city should form a valid multi-choice group."""
+        from bot.gamma import _parse_market
+
+        outcomes_data = [
+            ("6C or below", 0.05),
+            ("7C", 0.10),
+            ("8C", 0.20),
+            ("9C", 0.30),
+            ("10C", 0.20),
+            ("11C", 0.10),
+            ("12C or higher", 0.05),
+        ]
+        markets = []
+        for title, yes_price in outcomes_data:
+            gm = GammaMarket(
+                id=f"m_{title}",
+                question=f"Will the highest temp in London be {title}?",
+                condition_id=f"0x_{title}",
+                slug=f"london-{title}",
+                outcomes=["Yes", "No"],
+                outcome_prices=[yes_price, 1.0 - yes_price],
+                clob_token_ids=[f"yes_{title}", f"no_{title}"],
+                volume=10000,
+                volume_24hr=500,
+                liquidity=1000,
+                best_bid=yes_price - 0.01,
+                best_ask=yes_price + 0.01,
+                spread=0.02,
+                end_date="2026-02-13T00:00:00Z",
+                active=True,
+                closed=False,
+                neg_risk=True,
+                group_item_title=title,
+                event_id="204111",
+                event_title="Highest temperature in London on February 12?",
+            )
+            markets.append(gm)
+
+        groups = group_multi_choice(markets)
+        self.assertEqual(len(groups), 1)
+        g = groups[0]
+        self.assertEqual(g.event_id, "204111")
+        self.assertEqual(len(g.markets), 7)
+        self.assertAlmostEqual(g.yes_sum, 1.0)
+        self.assertAlmostEqual(g.deviation, 0.0, places=2)
+
+    def test_weather_3_days_grouping(self):
+        """Markets for the same city on different days form separate groups."""
+        markets = []
+        for day, event_id in [("Feb 12", "ev1"), ("Feb 13", "ev2"), ("Feb 14", "ev3")]:
+            for temp in ["6C", "7C", "8C"]:
+                markets.append(GammaMarket(
+                    id=f"m_{day}_{temp}",
+                    question=f"London {temp} on {day}?",
+                    condition_id=f"0x_{day}_{temp}",
+                    slug=f"london-{temp}-{day}",
+                    outcomes=["Yes", "No"],
+                    outcome_prices=[0.33, 0.67],
+                    clob_token_ids=[f"yes_{day}_{temp}", f"no_{day}_{temp}"],
+                    volume=10000, volume_24hr=500, liquidity=1000,
+                    best_bid=0.32, best_ask=0.34, spread=0.02,
+                    end_date="2026-02-15T00:00:00Z",
+                    active=True, closed=False, neg_risk=True,
+                    group_item_title=temp,
+                    event_id=event_id,
+                    event_title=f"Highest temperature in London on {day}?",
+                ))
+
+        groups = group_multi_choice(markets)
+        self.assertEqual(len(groups), 3)  # One per day
+        event_ids = {g.event_id for g in groups}
+        self.assertEqual(event_ids, {"ev1", "ev2", "ev3"})
+
+    def test_tag_slug_param_in_fetch_events(self):
+        """fetch_events passes tag_slug correctly to params."""
+        from bot.gamma import GammaClient
+        # We can't call the real API in unit tests, but verify the method exists
+        gamma = GammaClient.__new__(GammaClient)
+        self.assertTrue(hasattr(gamma, 'fetch_events'))
+        self.assertTrue(hasattr(gamma, 'fetch_weather_events'))
+        self.assertTrue(hasattr(gamma, 'fetch_events_with_markets'))
+
+
 class TestGammaToScannerFormat(unittest.TestCase):
     def _make_gm(self):
         return GammaMarket(

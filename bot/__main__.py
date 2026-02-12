@@ -100,6 +100,7 @@ def main() -> None:
     )
     parser.add_argument("--scan", action="store_true", help="Show tradeable markets and exit")
     parser.add_argument("--signals", action="store_true", help="Show detected signals and exit")
+    parser.add_argument("--weather", action="store_true", help="Scan weather/temperature markets and exit")
     parser.add_argument("--calibration", action="store_true", help="Show calibration stats and exit")
     parser.add_argument("--verbose", action="store_true", help="DEBUG logging")
     parser.add_argument("--json-log", action="store_true", help="Structured JSON logs (for OpenClaw)")
@@ -188,6 +189,70 @@ def main() -> None:
         )
     else:
         client = _PublicClient()
+
+    # --weather
+    if args.weather:
+        from .gamma import GammaClient, group_multi_choice, gamma_to_scanner_format
+        from .signals import scan_for_signals
+        with GammaClient() as gamma:
+            events, all_markets = gamma.fetch_events_with_markets(
+                tag_slug="weather", limit=100,
+            )
+
+            # Group multi-choice and convert to scanner format
+            mc_groups = group_multi_choice(all_markets, gamma_client=gamma)
+            tradeable = gamma_to_scanner_format(all_markets)
+
+            # Display events summary
+            print(f"\n── Weather events ({len(events)}) ──")
+            for ev in events:
+                title = ev.get("title", "?")[:60]
+                vol = float(ev.get("volume", 0))
+                n = len(ev.get("markets", []))
+                print(f"  {title:<60} vol=${vol:>10,.0f}  ({n} outcomes)")
+
+            # Display multi-choice arb opportunities
+            if mc_groups:
+                print(f"\n── Multi-choice groups ({len(mc_groups)}) ──")
+                print(f"  {'Event':<55} {'N':>3} {'Σ YES':>7} {'Dev':>7}")
+                print("  " + "-" * 75)
+                for g in mc_groups:
+                    title = g.event_title[:53] if g.event_title else f"event_{g.event_id}"
+                    print(f"  {title:<55} {len(g.markets):>3} {g.yes_sum:>6.3f} {g.deviation:>+6.3f}")
+
+            # Detect signals if we have data
+            if tradeable:
+                token_ids = [t["token_id"] for m in tradeable for t in m.get("tokens", [])]
+                token_prices = {
+                    t["token_id"]: t.get("price", 0)
+                    for m in tradeable for t in m.get("tokens", [])
+                }
+                token_pairs = {}
+                for m in tradeable:
+                    toks = m.get("tokens", [])
+                    if len(toks) == 2:
+                        token_pairs[m["condition_id"]] = (toks[0]["token_id"], toks[1]["token_id"])
+
+                signals = scan_for_signals(
+                    client, token_ids, config,
+                    multi_choice_groups=mc_groups,
+                    token_prices=token_prices,
+                    token_pairs=token_pairs,
+                )
+                if signals:
+                    print(f"\n── Signals ({len(signals)}) ──")
+                    print(f"  {'Side':<5} {'Token':<18} {'Price':>6} {'Edge':>6} {'Method':<20} {'Conf':>5}")
+                    print("  " + "-" * 64)
+                    for s in signals:
+                        print(
+                            f"  {s.side:<4} {s.token_id[:16]:<18} {s.market_price:>5.3f} "
+                            f"{s.edge:>6.4f} {s.method:<20} {s.confidence:>5.2f}"
+                        )
+                else:
+                    print("\nNo signals detected on weather markets.")
+
+            print(f"\n{len(all_markets)} weather markets total, {len(events)} events")
+        return
 
     # --scan
     if args.scan:
