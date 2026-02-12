@@ -27,9 +27,11 @@ def scan_markets(client: PolymarketClient, **filters) -> list[dict]:
     markets: list[dict] = []
 
     for m in raw:
-        if not m.get("active", True):
-            continue
         if m.get("closed", False):
+            continue
+        if not m.get("accepting_orders", m.get("active", True)):
+            continue
+        if not m.get("enable_order_book", True):
             continue
 
         tokens = m.get("tokens", [])

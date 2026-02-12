@@ -97,9 +97,12 @@ class TestScanMarkets(unittest.TestCase):
         class FakeClient:
             def get_markets(self, **kw):
                 return [
-                    {"condition_id": "c1", "question": "Q1", "tokens": [{"token_id": "t1"}], "active": True},
-                    {"condition_id": "c2", "question": "Q2", "tokens": [{"token_id": "t2"}], "active": False},
-                    {"condition_id": "c3", "question": "Q3", "tokens": [{"token_id": "t3"}], "closed": True},
+                    {"condition_id": "c1", "question": "Q1", "tokens": [{"token_id": "t1"}],
+                     "accepting_orders": True, "enable_order_book": True},
+                    {"condition_id": "c2", "question": "Q2", "tokens": [{"token_id": "t2"}],
+                     "accepting_orders": False},
+                    {"condition_id": "c3", "question": "Q3", "tokens": [{"token_id": "t3"}],
+                     "closed": True},
                     {"condition_id": "c4", "question": "Q4", "tokens": []},
                 ]
 

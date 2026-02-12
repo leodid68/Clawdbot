@@ -6,9 +6,56 @@ import logging
 import sys
 from pathlib import Path
 
+import httpx
+from polymarket.constants import CLOB_BASE_URL
+
 from .config import Config
 from .state import TradingState
 from .strategy import run_strategy
+
+
+class _PublicClient:
+    """Lightweight read-only client for public CLOB endpoints (no private key)."""
+
+    def __init__(self):
+        self._http = httpx.Client(base_url=CLOB_BASE_URL, timeout=15)
+
+    def get_markets(self, **filters) -> list[dict]:
+        limit = filters.pop("limit", None)
+        params = "&".join(f"{k}={v}" for k, v in filters.items())
+        path = "/sampling-markets" + (f"?{params}" if params else "")
+        resp = self._http.get(path)
+        resp.raise_for_status()
+        data = resp.json()
+        if isinstance(data, dict):
+            items = data.get("data", data.get("markets", []))
+        else:
+            items = data
+        if limit is not None:
+            items = items[:int(limit)]
+        return items
+
+    def get_orderbook(self, token_id: str) -> dict:
+        resp = self._http.get(f"/book?token_id={token_id}")
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_price(self, token_id: str) -> dict:
+        resp = self._http.get(f"/price?token_id={token_id}")
+        resp.raise_for_status()
+        return resp.json()
+
+    def post_order(self, *args, **kwargs):
+        raise RuntimeError("Cannot post orders without private key (use --live with POLY_PRIVATE_KEY)")
+
+    def close(self):
+        self._http.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
 
 
 def _setup_logging(level: str = "INFO", json_log: bool = False) -> None:
@@ -112,19 +159,25 @@ def main() -> None:
                 print(f"  {b:<12} {p:>10.3f} {a:>10.3f} {c:>6}")
         return
 
-    # Resolve private key
-    if not config.private_key:
-        print("Error: set POLY_PRIVATE_KEY env var or --set private_key=0x...")
-        sys.exit(1)
+    # ── Build client ─────────────────────────────────────────────────
+    # Read-only modes (--scan, --signals, dry-run) use a public HTTP
+    # wrapper that doesn't need a private key.  Live trading requires
+    # the full authenticated PolymarketClient.
+    needs_auth = args.live
+    client = None
 
-    # Build Polymarket client
-    from polymarket.client import PolymarketClient
-
-    api_creds = config.load_api_creds(config_dir)
-    client = PolymarketClient(
-        private_key=config.private_key,
-        api_creds=api_creds,
-    )
+    if needs_auth:
+        if not config.private_key:
+            print("Error: set POLY_PRIVATE_KEY env var or --set private_key=0x...")
+            sys.exit(1)
+        from polymarket.client import PolymarketClient
+        api_creds = config.load_api_creds(config_dir)
+        client = PolymarketClient(
+            private_key=config.private_key,
+            api_creds=api_creds,
+        )
+    else:
+        client = _PublicClient()
 
     # --scan
     if args.scan:
