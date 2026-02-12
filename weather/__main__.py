@@ -55,6 +55,12 @@ def main() -> None:
     # Load config
     config = Config.load(config_dir)
 
+    # Setup logging early so config.update() warnings are visible
+    log_level = "DEBUG" if args.verbose else config.log_level
+    _setup_logging(level=log_level, json_log=args.json_log)
+
+    logger = logging.getLogger(__name__)
+
     # Handle --set updates
     if args.set:
         updates: dict = {}
@@ -65,13 +71,7 @@ def main() -> None:
         if updates:
             config.update(updates)
             config.save(config_dir)
-            print(f"Config updated: {updates}")
-
-    # Setup logging
-    log_level = "DEBUG" if args.verbose else config.log_level
-    _setup_logging(level=log_level, json_log=args.json_log)
-
-    logger = logging.getLogger(__name__)
+            logger.info("Config updated: %s", updates)
 
     # Resolve state file path relative to config dir
     state_path = config.state_file

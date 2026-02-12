@@ -310,9 +310,7 @@ def _check_stop_loss_reversals(
 
         # Get current forecast for this location/date
         noaa_day = noaa_cache.get(trade.location, {}).get(trade.forecast_date, {})
-        # Determine metric from outcome context (use high if bucket center > 50, else low as heuristic)
-        # Better: check which metric by looking at the event, but we stored outcome_name
-        metric = "high"  # Default; we'll refine using ensemble
+        metric = trade.metric  # Use the metric stored at trade time
 
         noaa_temp = noaa_day.get(metric)
         om_data = open_meteo_cache.get(trade.location, {}).get(trade.forecast_date)
@@ -480,15 +478,21 @@ def run_weather_strategy(
             om_futures = {pool.submit(_fetch_open_meteo, loc): loc for loc in active_locs}
 
         for fut in as_completed(list(noaa_futures) + list(om_futures)):
+            is_noaa = fut in noaa_futures
+            loc = noaa_futures.get(fut) or om_futures.get(fut, "?")
+            source = "NOAA" if is_noaa else "Open-Meteo"
             try:
                 loc_name, data = fut.result()
-                if fut in noaa_futures:
+                if is_noaa:
                     noaa_cache[loc_name] = data
+                    if not data:
+                        logger.warning("NOAA returned empty forecast for %s", loc_name)
                 else:
                     open_meteo_cache[loc_name] = data
+                    if not data:
+                        logger.warning("Open-Meteo returned empty forecast for %s", loc_name)
             except Exception as exc:
-                loc = noaa_futures.get(fut) or om_futures.get(fut, "?")
-                logger.error("Forecast fetch failed for %s: %s", loc, exc)
+                logger.error("%s fetch crashed for %s: %s", source, loc, exc)
 
     logger.info("Forecasts ready: NOAA=%d, Open-Meteo=%d", len(noaa_cache), len(open_meteo_cache))
 
@@ -538,8 +542,17 @@ def run_weather_strategy(
                 forecast_temp = ensemble_temp
             else:
                 forecast_temp = noaa_temp
-        else:
+        elif noaa_temp is not None:
             forecast_temp = noaa_temp
+        elif om_data:
+            # Fallback: NOAA failed but Open-Meteo available
+            fallback_temp, _ = compute_ensemble_forecast(None, om_data, metric)
+            if fallback_temp is not None:
+                logger.warning("NOAA unavailable for %s %s — falling back to Open-Meteo (%.1f°F)",
+                               location, date_str, fallback_temp)
+            forecast_temp = fallback_temp
+        else:
+            forecast_temp = None
 
         if forecast_temp is None:
             logger.warning("No forecast available for %s %s", location, date_str)
@@ -698,6 +711,7 @@ def run_weather_strategy(
                         location=location,
                         forecast_date=date_str,
                         forecast_temp=forecast_temp,
+                        metric=metric,
                     )
 
                     # Correlation guard: record event → market mapping

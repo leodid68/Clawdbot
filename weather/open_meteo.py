@@ -23,11 +23,17 @@ MODEL_WEIGHTS = {
 _MODELS = "gfs_seamless,ecmwf_ifs025"
 
 
+_USER_AGENT = "SimmerWeatherSkill/2.0 (https://simmer.markets)"
+
+
 def _fetch_json(url: str, max_retries: int = 3, base_delay: float = 1.0) -> dict | None:
     """Fetch JSON with retry."""
     for attempt in range(max_retries + 1):
         try:
-            req = Request(url, headers={"Accept": "application/json"})
+            req = Request(url, headers={
+                "Accept": "application/json",
+                "User-Agent": _USER_AGENT,
+            })
             with urlopen(req, timeout=30) as resp:
                 return json.loads(resp.read().decode())
         except (HTTPError, URLError, TimeoutError) as exc:
@@ -43,6 +49,17 @@ def _fetch_json(url: str, max_retries: int = 3, base_delay: float = 1.0) -> dict
             logger.error("Open-Meteo JSON parse error: %s", exc)
             return None
     return None
+
+
+def _timezone_for_lon(lon: float) -> str:
+    """Approximate US timezone from longitude."""
+    if lon > -82:
+        return "America/New_York"
+    elif lon > -100:
+        return "America/Chicago"
+    elif lon > -115:
+        return "America/Denver"
+    return "America/Los_Angeles"
 
 
 def get_open_meteo_forecast(
@@ -63,12 +80,13 @@ def get_open_meteo_forecast(
             ...
         }
     """
+    tz = _timezone_for_lon(lon)
     url = (
         f"{OPEN_METEO_BASE}"
         f"?latitude={lat}&longitude={lon}"
         f"&daily=temperature_2m_max,temperature_2m_min"
         f"&temperature_unit=fahrenheit"
-        f"&timezone=America/New_York"
+        f"&timezone={tz}"
         f"&models={_MODELS}"
         f"&forecast_days=10"
     )

@@ -22,6 +22,7 @@ class TradeRecord:
     location: str = ""
     forecast_date: str = ""
     forecast_temp: float | None = None
+    metric: str = "high"  # "high" or "low"
 
     def to_dict(self) -> dict:
         return {
@@ -34,6 +35,7 @@ class TradeRecord:
             "location": self.location,
             "forecast_date": self.forecast_date,
             "forecast_temp": self.forecast_temp,
+            "metric": self.metric,
         }
 
     @classmethod
@@ -48,6 +50,7 @@ class TradeRecord:
             location=d.get("location", ""),
             forecast_date=d.get("forecast_date", ""),
             forecast_temp=d.get("forecast_temp"),
+            metric=d.get("metric", "high"),
         )
 
 
@@ -110,6 +113,7 @@ class TradingState:
         location: str = "",
         forecast_date: str = "",
         forecast_temp: float | None = None,
+        metric: str = "high",
     ) -> None:
         self.trades[market_id] = TradeRecord(
             market_id=market_id,
@@ -121,6 +125,7 @@ class TradingState:
             location=location,
             forecast_date=forecast_date,
             forecast_temp=forecast_temp,
+            metric=metric,
         )
 
     def remove_trade(self, market_id: str) -> None:
