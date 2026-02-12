@@ -219,6 +219,32 @@ def run_strategy(
     else:
         raw_markets = _scan_with_clob(client, config)
 
+    # ── 2b. Weather markets (optional) ─────────────────────────────
+    if config.weather_enabled and config.use_gamma:
+        try:
+            from .gamma import GammaClient, group_multi_choice, gamma_to_scanner_format
+            with GammaClient() as gamma:
+                _, weather_markets = gamma.fetch_events_with_markets(tag_slug="weather")
+                weather_mc_groups = group_multi_choice(weather_markets, gamma_client=gamma)
+                weather_tradeable = gamma_to_scanner_format(weather_markets)
+                # Deduplicate: skip markets already in main scan
+                existing_cids = {m.get("condition_id") for m in raw_markets}
+                weather_tradeable = [
+                    m for m in weather_tradeable
+                    if m.get("condition_id") not in existing_cids
+                ]
+                existing_eids = {g.event_id for g in multi_choice_groups}
+                weather_mc_groups = [
+                    g for g in weather_mc_groups
+                    if g.event_id not in existing_eids
+                ]
+                raw_markets.extend(weather_tradeable)
+                multi_choice_groups.extend(weather_mc_groups)
+                logger.info("Weather: +%d markets, +%d multi-choice groups (after dedup)",
+                            len(weather_tradeable), len(weather_mc_groups))
+        except Exception as exc:
+            logger.warning("Weather scan failed: %s — continuing without", exc)
+
     # ── 3. Filter by liquidity ───────────────────────────────────────
     tradeable = filter_tradeable(raw_markets, min_liquidity=config.min_liquidity_grade)
 
@@ -343,7 +369,11 @@ def run_strategy(
         )
 
     # ── 8. Persist state ─────────────────────────────────────────────
-    state.save(state_path)
+    try:
+        state.save(state_path)
+    except Exception as exc:
+        logger.critical("FAILED TO SAVE STATE: %s", exc)
+        raise
     logger.info("Done.")
 
 

@@ -136,8 +136,12 @@ class PolymarketClient:
         return self._request("GET", f"/book?token_id={token_id}", auth=False)
 
     def get_price(self, token_id: str) -> dict:
-        """Fetch current price info for a token."""
-        return self._request("GET", f"/price?token_id={token_id}", auth=False)
+        """Fetch current midpoint price for a token."""
+        data = self._request("GET", f"/midpoint?token_id={token_id}", auth=False)
+        # Normalize: /midpoint returns {"mid": "0.xx"}, callers expect {"price": ...}
+        if "mid" in data and "price" not in data:
+            data["price"] = data["mid"]
+        return data
 
     def is_neg_risk(self, token_id: str) -> bool:
         """Check if a token uses the neg-risk exchange."""

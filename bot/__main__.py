@@ -54,9 +54,13 @@ class _PublicClient:
         return resp.json()
 
     def get_price(self, token_id: str) -> dict:
-        resp = self._http.get(f"/price?token_id={token_id}")
+        resp = self._http.get(f"/midpoint?token_id={token_id}")
         resp.raise_for_status()
-        return resp.json()
+        data = resp.json()
+        # Normalize: /midpoint returns {"mid": "0.xx"}, callers expect {"price": ...}
+        if "mid" in data and "price" not in data:
+            data["price"] = data["mid"]
+        return data
 
     def post_order(self, *args, **kwargs):
         raise RuntimeError("Cannot post orders without private key (use --live with POLY_PRIVATE_KEY)")
@@ -102,6 +106,10 @@ def main() -> None:
     parser.add_argument("--signals", action="store_true", help="Show detected signals and exit")
     parser.add_argument("--weather", action="store_true", help="Scan weather/temperature markets and exit")
     parser.add_argument("--calibration", action="store_true", help="Show calibration stats and exit")
+    parser.add_argument("--daemon", action="store_true",
+                        help="Run continuously (daemon mode for OpenClaw)")
+    parser.add_argument("--health", action="store_true",
+                        help="Check daemon health and exit")
     parser.add_argument("--verbose", action="store_true", help="DEBUG logging")
     parser.add_argument("--json-log", action="store_true", help="Structured JSON logs (for OpenClaw)")
 
@@ -129,6 +137,13 @@ def main() -> None:
     state_path = config.state_file
     if not Path(state_path).is_absolute():
         state_path = str(Path(config_dir) / state_path)
+
+    # --health
+    if args.health:
+        from .daemon import check_health
+        ok, msg = check_health(state_path)
+        print(msg)
+        sys.exit(0 if ok else 1)
 
     # --config
     if args.config:
@@ -171,6 +186,27 @@ def main() -> None:
             print(f"  {'Bin':<12} {'Predicted':>10} {'Actual':>10} {'Count':>6}")
             for b, p, a, c in zip(curve["bins"], curve["predicted"], curve["actual"], curve["count"]):
                 print(f"  {b:<12} {p:>10.3f} {a:>10.3f} {c:>6}")
+        return
+
+    # --daemon (before client build — daemon manages its own client lifecycle)
+    if args.daemon:
+        from .daemon import run_daemon
+
+        if args.live and not config.private_key:
+            print("Error: set POLY_PRIVATE_KEY env var or --set private_key=0x...")
+            sys.exit(1)
+
+        def _make_client():
+            if args.live:
+                from polymarket.client import PolymarketClient
+                api_creds = config.load_api_creds(config_dir)
+                return PolymarketClient(
+                    private_key=config.private_key,
+                    api_creds=api_creds,
+                )
+            return _PublicClient()
+
+        run_daemon(_make_client, config, state_path, dry_run=not args.live)
         return
 
     # ── Build client ─────────────────────────────────────────────────

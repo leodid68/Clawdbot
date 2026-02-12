@@ -65,6 +65,15 @@ class Config:
     gamma_min_volume: float = 1000.0
     gamma_min_liquidity: float = 100.0
 
+    # Daemon mode
+    run_interval_seconds: int = 60
+    retry_max_attempts: int = 5
+    retry_backoff_base: float = 2.0
+    retry_backoff_max: float = 300.0
+
+    # Weather integration
+    weather_enabled: bool = True
+
     # State
     state_file: str = "state.json"
 
