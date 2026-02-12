@@ -14,5 +14,10 @@
   "max_days_ahead": 7,
   "seasonal_adjustments": true,
   "adjacent_buckets": true,
-  "dynamic_exits": true
+  "dynamic_exits": true,
+  "multi_source": true,
+  "forecast_change_threshold": 3.0,
+  "correlation_guard": true,
+  "stop_loss_reversal": true,
+  "stop_loss_reversal_threshold": 5.0
 }

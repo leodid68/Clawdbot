@@ -5,11 +5,12 @@ from datetime import datetime, timezone
 
 from .config import Config, LOCATIONS, MIN_SHARES_PER_ORDER, MIN_TICK_SIZE, TRADE_SOURCE
 from .noaa import get_noaa_forecast
+from .open_meteo import compute_ensemble_forecast, get_open_meteo_forecast
 from .parsing import parse_weather_event, parse_temperature_bucket
 from .probability import estimate_bucket_probability, get_horizon_days, get_noaa_probability
 from .simmer_client import SimmerClient
 from .sizing import compute_exit_threshold, compute_position_size
-from .state import TradingState
+from .state import PredictionRecord, TradingState
 
 # Trade journal integration (optional)
 from . import JOURNAL_AVAILABLE, log_trade
@@ -265,6 +266,11 @@ def check_exit_opportunities(
                         )
 
                     state.remove_trade(market_id)
+                    # Clean up correlation guard
+                    for eid, mid in list(state.event_positions.items()):
+                        if mid == market_id:
+                            state.remove_event_position(eid)
+                            break
                 else:
                     logger.error("Sell failed: %s", result.get("error", "Unknown"))
         else:
@@ -274,6 +280,90 @@ def check_exit_opportunities(
             )
 
     return exits_found, exits_executed
+
+
+# --------------------------------------------------------------------------
+# Stop-loss on forecast reversal
+# --------------------------------------------------------------------------
+
+def _check_stop_loss_reversals(
+    client: SimmerClient,
+    config: Config,
+    state: TradingState,
+    noaa_cache: dict[str, dict],
+    open_meteo_cache: dict[str, dict],
+    dry_run: bool,
+) -> int:
+    """Exit positions where the forecast has shifted away from our bucket.
+
+    Returns number of stop-loss exits executed.
+    """
+    exits = 0
+    for market_id, trade in list(state.trades.items()):
+        if not trade.forecast_temp or not trade.forecast_date or not trade.location:
+            continue
+
+        bucket = parse_temperature_bucket(trade.outcome_name)
+        if not bucket:
+            continue
+
+        # Get current forecast for this location/date
+        noaa_day = noaa_cache.get(trade.location, {}).get(trade.forecast_date, {})
+        # Determine metric from outcome context (use high if bucket center > 50, else low as heuristic)
+        # Better: check which metric by looking at the event, but we stored outcome_name
+        metric = "high"  # Default; we'll refine using ensemble
+
+        noaa_temp = noaa_day.get(metric)
+        om_data = open_meteo_cache.get(trade.location, {}).get(trade.forecast_date)
+
+        if config.multi_source and (noaa_temp is not None or om_data):
+            current_temp, _ = compute_ensemble_forecast(noaa_temp, om_data, metric)
+        else:
+            current_temp = noaa_temp
+
+        if current_temp is None:
+            continue
+
+        # How far has the forecast moved from our original entry forecast?
+        shift = abs(current_temp - trade.forecast_temp)
+        bucket_center = (bucket[0] + bucket[1]) / 2.0
+
+        # Check if current forecast is now outside our bucket AND shifted significantly
+        if shift >= config.stop_loss_reversal_threshold and not (bucket[0] <= current_temp <= bucket[1]):
+            logger.warning(
+                "STOP-LOSS: %s forecast shifted %.1f°F (was %.0f°F, now %.0f°F) — bucket %s no longer viable",
+                trade.location, shift, trade.forecast_temp, current_temp, trade.outcome_name,
+            )
+
+            # Attempt to sell
+            fresh = client.get_position(market_id)
+            fresh_shares = 0.0
+            if fresh:
+                fresh_shares = fresh.get("shares_yes") or fresh.get("shares") or 0
+
+            if fresh_shares < MIN_SHARES_PER_ORDER:
+                logger.info("Position already closed for %s", market_id)
+                state.remove_trade(market_id)
+                continue
+
+            if dry_run:
+                logger.info("[DRY RUN] Would stop-loss sell %.1f shares of %s", fresh_shares, trade.outcome_name)
+            else:
+                logger.info("Stop-loss selling %.1f shares of %s...", fresh_shares, trade.outcome_name)
+                result = client.execute_sell(market_id, fresh_shares)
+                if result.get("success"):
+                    exits += 1
+                    state.remove_trade(market_id)
+                    # Clean up correlation guard
+                    for eid, mid in list(state.event_positions.items()):
+                        if mid == market_id:
+                            state.remove_event_position(eid)
+                            break
+                    logger.info("Stop-loss executed for %s", trade.outcome_name)
+                else:
+                    logger.error("Stop-loss sell failed: %s", result.get("error", "Unknown"))
+
+    return exits
 
 
 # --------------------------------------------------------------------------
@@ -351,9 +441,22 @@ def run_weather_strategy(
 
     logger.info("Grouped into %d events", len(events))
 
-    forecast_cache: dict[str, dict] = {}
+    noaa_cache: dict[str, dict] = {}  # location → {date: {high, low}}
+    open_meteo_cache: dict[str, dict] = {}  # location → {date: {gfs_high, ecmwf_high, ...}}
     trades_executed = 0
     opportunities_found = 0
+
+    # Pre-fetch Open-Meteo forecasts for all active locations
+    if config.multi_source:
+        for loc_name in config.active_locations:
+            loc_data = LOCATIONS.get(loc_name)
+            if loc_data:
+                logger.info("Fetching Open-Meteo multi-model forecast for %s...", loc_name)
+                open_meteo_cache[loc_name] = get_open_meteo_forecast(
+                    loc_data["lat"], loc_data["lon"],
+                    max_retries=config.max_retries,
+                    base_delay=config.retry_base_delay,
+                )
 
     for event_id, event_markets in events.items():
         event_name = event_markets[0].get("event_name", "") if event_markets else ""
@@ -376,26 +479,59 @@ def run_weather_strategy(
                          location, date_str, days_ahead, config.max_days_ahead)
             continue
 
+        # Correlation guard: max 1 position per event
+        if config.correlation_guard and state.has_event_position(event_id):
+            existing_mid = state.event_positions.get(event_id, "")
+            logger.info("Correlation guard: already hold position in event %s (market %s) — skip",
+                         event_id, existing_mid)
+            continue
+
         logger.info("%s %s (%s temp)", location, date_str, metric)
 
         # Fetch NOAA forecast (cached per location)
-        if location not in forecast_cache:
+        if location not in noaa_cache:
             logger.info("Fetching NOAA forecast for %s...", location)
-            forecast_cache[location] = get_noaa_forecast(
+            noaa_cache[location] = get_noaa_forecast(
                 location, LOCATIONS,
                 max_retries=config.max_retries,
                 base_delay=config.retry_base_delay,
             )
 
-        forecasts = forecast_cache[location]
+        forecasts = noaa_cache[location]
         day_forecast = forecasts.get(date_str, {})
-        forecast_temp = day_forecast.get(metric)
+        noaa_temp = day_forecast.get(metric)
+
+        # Multi-source ensemble forecast
+        om_data = open_meteo_cache.get(location, {}).get(date_str)
+        if config.multi_source and (noaa_temp is not None or om_data):
+            ensemble_temp, model_spread = compute_ensemble_forecast(noaa_temp, om_data, metric)
+            if ensemble_temp is not None:
+                logger.info("Ensemble forecast: %.1f°F (NOAA=%s, spread=%.1f°F)",
+                             ensemble_temp,
+                             f"{noaa_temp}°F" if noaa_temp is not None else "N/A",
+                             model_spread)
+                forecast_temp = ensemble_temp
+            else:
+                forecast_temp = noaa_temp
+        else:
+            forecast_temp = noaa_temp
 
         if forecast_temp is None:
             logger.warning("No forecast available for %s %s", location, date_str)
             continue
 
-        logger.info("NOAA forecast: %d F", forecast_temp)
+        # Forecast change detection
+        delta = state.get_forecast_delta(location, date_str, metric, forecast_temp)
+        state.store_forecast(location, date_str, metric, forecast_temp)
+        if delta is not None:
+            abs_delta = abs(delta)
+            if abs_delta >= config.forecast_change_threshold:
+                logger.info("Forecast shifted %+.1f°F since last run — re-evaluating", delta)
+            else:
+                logger.debug("Forecast delta: %+.1f°F (below threshold %.1f°F)",
+                             delta, config.forecast_change_threshold)
+
+        logger.info("Forecast: %.0f°F", forecast_temp)
 
         # Dynamic NOAA probability
         noaa_prob = get_noaa_probability(date_str, apply_seasonal=config.seasonal_adjustments)
@@ -518,7 +654,7 @@ def run_weather_strategy(
                         log_trade(
                             trade_id=trade_id,
                             source=TRADE_SOURCE,
-                            thesis=f"NOAA forecasts {forecast_temp}F for {location} on {date_str}, "
+                            thesis=f"Ensemble forecasts {forecast_temp:.0f}F for {location} on {date_str}, "
                                    f"bucket '{outcome_name}' underpriced at ${price:.2f}",
                             confidence=confidence,
                             location=location,
@@ -539,10 +675,33 @@ def run_weather_strategy(
                         forecast_temp=forecast_temp,
                     )
 
+                    # Correlation guard: record event → market mapping
+                    if config.correlation_guard:
+                        state.record_event_position(event_id, market_id)
+
+                    # Calibration: record prediction
+                    bucket = entry["bucket"]
+                    state.record_prediction(PredictionRecord(
+                        market_id=market_id,
+                        event_id=event_id,
+                        location=location,
+                        forecast_date=date_str,
+                        metric=metric,
+                        our_probability=prob,
+                        forecast_temp=forecast_temp,
+                        bucket_low=bucket[0],
+                        bucket_high=bucket[1],
+                        timestamp=datetime.now(timezone.utc).isoformat(),
+                    ))
+
                     # Update remaining balance
                     balance = max(0.0, balance - position_size)
                 else:
                     logger.error("Trade failed: %s", result.get("error", "Unknown"))
+
+    # Stop-loss: check if forecast has reversed away from our held positions
+    if config.stop_loss_reversal:
+        _check_stop_loss_reversals(client, config, state, noaa_cache, open_meteo_cache, dry_run)
 
     # Check exits
     exits_found, exits_executed = check_exit_opportunities(
@@ -557,6 +716,12 @@ def run_weather_strategy(
 
     if dry_run:
         logger.info("[DRY RUN MODE — no real trades executed]")
+
+    # Calibration stats
+    cal = state.get_calibration_stats()
+    if cal["count"] > 0:
+        logger.info("Calibration: %d resolved, Brier=%.4f, accuracy=%.1f%%",
+                     cal["count"], cal["brier"], cal["accuracy"] * 100)
 
     # Persist state
     save_path = state_path or config.state_file

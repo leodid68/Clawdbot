@@ -75,6 +75,19 @@ class Config:
     time_to_resolution_min_hours: int = 2
     price_drop_threshold: float = 0.10
 
+    # Multi-source forecasting (Open-Meteo)
+    multi_source: bool = True
+
+    # Forecast change detection
+    forecast_change_threshold: float = 3.0  # °F change to trigger re-evaluation
+
+    # Correlation guard (max 1 position per event)
+    correlation_guard: bool = True
+
+    # Stop-loss on forecast reversal
+    stop_loss_reversal: bool = True
+    stop_loss_reversal_threshold: float = 5.0  # °F shift away from our bucket
+
     @property
     def active_locations(self) -> list[str]:
         """Return canonical location keys matching LOCATIONS dict keys.
