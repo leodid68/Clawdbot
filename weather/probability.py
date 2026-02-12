@@ -57,7 +57,7 @@ def get_horizon_days(forecast_date: str) -> int:
     try:
         target = datetime.strptime(forecast_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     except ValueError:
-        return 3  # Fallback
+        return 999  # Invalid date — will be filtered by max_days_ahead
     now = datetime.now(timezone.utc)
     delta = (target - now).total_seconds() / 86400
     return max(0, round(delta))

@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from .config import Config, LOCATIONS, MIN_SHARES_PER_ORDER, MIN_TICK_SIZE, TRADE_SOURCE
 from .noaa import get_noaa_forecast
 from .parsing import parse_weather_event, parse_temperature_bucket
-from .probability import estimate_bucket_probability, get_noaa_probability
+from .probability import estimate_bucket_probability, get_horizon_days, get_noaa_probability
 from .simmer_client import SimmerClient
 from .sizing import compute_exit_threshold, compute_position_size
 from .state import TradingState
@@ -15,9 +15,6 @@ from .state import TradingState
 from . import JOURNAL_AVAILABLE, log_trade
 
 logger = logging.getLogger(__name__)
-
-# Context safeguard thresholds (defaults; overridden by Config)
-PRICE_DROP_THRESHOLD = 0.10
 
 
 # --------------------------------------------------------------------------
@@ -100,7 +97,7 @@ def _parse_time_to_hours(time_str: str) -> float | None:
         return None
 
 
-def detect_price_trend(history: list) -> dict:
+def detect_price_trend(history: list, price_drop_threshold: float = 0.10) -> dict:
     """Analyze price history for 24h trend."""
     if not history or len(history) < 2:
         return {"direction": "unknown", "change_24h": 0, "is_opportunity": False}
@@ -114,9 +111,9 @@ def detect_price_trend(history: list) -> dict:
 
     change = (recent_price - old_price) / old_price
 
-    if change < -PRICE_DROP_THRESHOLD:
+    if change < -price_drop_threshold:
         return {"direction": "down", "change_24h": change, "is_opportunity": True}
-    elif change > PRICE_DROP_THRESHOLD:
+    elif change > price_drop_threshold:
         return {"direction": "up", "change_24h": change, "is_opportunity": False}
     return {"direction": "flat", "change_24h": change, "is_opportunity": False}
 
@@ -373,7 +370,6 @@ def run_weather_strategy(
             continue
 
         # Check max forecast horizon
-        from .probability import get_horizon_days
         days_ahead = get_horizon_days(date_str)
         if days_ahead > config.max_days_ahead:
             logger.debug("Skipping %s %s — %d days ahead (max %d)",
@@ -449,7 +445,7 @@ def run_weather_strategy(
                 outcome_name, price, prob * 100, ev,
             )
 
-            if price >= config.entry_threshold and ev < config.min_ev_threshold:
+            if price >= config.entry_threshold:
                 logger.info("Price $%.2f above entry threshold $%.2f — skip", price, config.entry_threshold)
                 continue
 
@@ -466,7 +462,7 @@ def run_weather_strategy(
             # Price trend
             if use_trends:
                 history = client.get_price_history(market_id)
-                trend = detect_price_trend(history)
+                trend = detect_price_trend(history, config.price_drop_threshold)
                 if trend["is_opportunity"]:
                     logger.info("Price dropped %.0f%% in 24h — stronger signal", abs(trend["change_24h"]) * 100)
 
@@ -544,7 +540,7 @@ def run_weather_strategy(
                     )
 
                     # Update remaining balance
-                    balance -= position_size
+                    balance = max(0.0, balance - position_size)
                 else:
                     logger.error("Trade failed: %s", result.get("error", "Unknown"))
 

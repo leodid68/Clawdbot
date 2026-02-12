@@ -56,7 +56,10 @@ def compute_position_size(
 
     size = balance * frac
     size = min(size, max_position_usd)
-    size = max(size, min_trade)
+
+    # If Kelly says less than the minimum viable trade, don't trade at all
+    if size < min_trade:
+        return 0.0
 
     # Don't bet more than we have
     size = min(size, balance)

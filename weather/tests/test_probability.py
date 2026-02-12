@@ -27,8 +27,9 @@ class TestGetHorizonDays(unittest.TestCase):
         self.assertGreaterEqual(days, 6)
         self.assertLessEqual(days, 8)
 
-    def test_invalid_date_fallback(self):
-        self.assertEqual(get_horizon_days("not-a-date"), 3)
+    def test_invalid_date_returns_large_value(self):
+        """Invalid date should return large horizon to be filtered out."""
+        self.assertGreater(get_horizon_days("not-a-date"), 100)
 
 
 class TestGetNoaaProbability(unittest.TestCase):

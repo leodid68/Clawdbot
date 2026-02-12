@@ -88,7 +88,7 @@ def parse_temperature_bucket(outcome_name: str) -> tuple[int, int] | None:
 
     # "X or below / or less"
     below_match = re.search(
-        r"(\d+)\s*°?[fF]?\s*(?:or below|or less|and below|and under)",
+        r"(-?\d+)\s*°?[fF]?\s*(?:or below|or less|and below|and under)",
         outcome_name,
         re.IGNORECASE,
     )
@@ -97,7 +97,7 @@ def parse_temperature_bucket(outcome_name: str) -> tuple[int, int] | None:
 
     # "X or higher / or above / or more"
     above_match = re.search(
-        r"(\d+)\s*°?[fF]?\s*(?:or higher|or above|or more|and above|and over|\+)",
+        r"(-?\d+)\s*°?[fF]?\s*(?:or higher|or above|or more|and above|and over|\+)",
         outcome_name,
         re.IGNORECASE,
     )
@@ -105,7 +105,7 @@ def parse_temperature_bucket(outcome_name: str) -> tuple[int, int] | None:
         return (int(above_match.group(1)), 999)
 
     # "X - Y" or "X to Y"
-    range_match = re.search(r"(\d+)\s*[-–to]+\s*(\d+)", outcome_name)
+    range_match = re.search(r"(-?\d+)\s*(?:[-\u2013]|to)\s*(-?\d+)", outcome_name)
     if range_match:
         low, high = int(range_match.group(1)), int(range_match.group(2))
         return (min(low, high), max(low, high))

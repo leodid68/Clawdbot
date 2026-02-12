@@ -88,6 +88,14 @@ class TestComputePositionSize(unittest.TestCase):
             compute_position_size(0.80, 1.0, 100.0, 5.0), 0.0
         )
 
+    def test_tiny_edge_below_min_trade_returns_zero(self):
+        """When Kelly says bet $0.10 but min_trade is $1.00, return 0 (don't override Kelly)."""
+        size = compute_position_size(
+            probability=0.52, price=0.50, balance=10.0,
+            max_position_usd=5.0, kelly_frac=0.25, min_trade=1.0,
+        )
+        self.assertEqual(size, 0.0)
+
 
 class TestComputeExitThreshold(unittest.TestCase):
 

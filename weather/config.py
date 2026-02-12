@@ -77,7 +77,22 @@ class Config:
 
     @property
     def active_locations(self) -> list[str]:
-        return [loc.strip().upper() for loc in self.locations.split(",") if loc.strip()]
+        """Return canonical location keys matching LOCATIONS dict keys.
+
+        Input is case-insensitive: ``"nyc,chicago"`` → ``["NYC", "Chicago"]``.
+        """
+        canonical = {k.lower(): k for k in LOCATIONS}
+        result = []
+        for raw in self.locations.split(","):
+            raw = raw.strip()
+            if not raw:
+                continue
+            canon = canonical.get(raw.lower())
+            if canon:
+                result.append(canon)
+            else:
+                result.append(raw)  # Pass through unknown locations as-is
+        return result
 
     @classmethod
     def load(cls, config_dir: str) -> "Config":

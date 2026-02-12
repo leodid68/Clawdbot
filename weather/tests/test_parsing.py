@@ -132,6 +132,16 @@ class TestParseTemperatureBucket(unittest.TestCase):
     def test_and_above(self):
         self.assertEqual(parse_temperature_bucket("70 and above"), (70, 999))
 
+    def test_negative_range(self):
+        self.assertEqual(parse_temperature_bucket("-5 to 0"), (-5, 0))
+
+    def test_negative_or_below(self):
+        self.assertEqual(parse_temperature_bucket("-10°F or below"), (-999, -10))
+
+    def test_range_with_to_word(self):
+        """'X to Y' should match as range, not false-match 't' and 'o' chars."""
+        self.assertEqual(parse_temperature_bucket("50 to 54"), (50, 54))
+
 
 if __name__ == "__main__":
     unittest.main()

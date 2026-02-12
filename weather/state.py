@@ -2,6 +2,8 @@
 
 import json
 import logging
+import os
+import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -92,13 +94,25 @@ class TradingState:
         return market_id in self.analyzed_markets
 
     def save(self, path: str) -> None:
+        """Atomic save: write to temp file then rename (prevents corruption on crash)."""
         data = {
             "trades": {mid: rec.to_dict() for mid, rec in self.trades.items()},
             "analyzed_markets": sorted(self.analyzed_markets),
             "last_run": datetime.now(timezone.utc).isoformat(),
         }
-        with open(path, "w") as f:
-            json.dump(data, f, indent=2)
+        dir_name = os.path.dirname(path) or "."
+        fd, tmp_path = tempfile.mkstemp(suffix=".tmp", dir=dir_name)
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp_path, path)  # Atomic on POSIX
+        except BaseException:
+            # Clean up temp file on failure
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
         logger.debug("State saved to %s", path)
 
     @classmethod

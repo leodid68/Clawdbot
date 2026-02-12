@@ -127,23 +127,12 @@ class SimmerClient:
     # ------------------------------------------------------------------
 
     def fetch_weather_markets(self) -> list:
-        url = f"{self.base_url}/api/markets?tags=weather&status=active&limit=100"
-        headers = {"Content-Type": "application/json"}
-
-        for attempt in range(self.max_retries + 1):
-            try:
-                req = Request(url, headers=headers)
-                with urlopen(req, timeout=30) as resp:
-                    data = json.loads(resp.read().decode())
-                return data.get("markets", [])
-            except (HTTPError, URLError, TimeoutError) as exc:
-                if attempt < self.max_retries:
-                    delay = self.base_delay * (2 ** attempt)
-                    logger.warning("Markets fetch error — retry %d/%d in %.1fs", attempt + 1, self.max_retries, delay)
-                    time.sleep(delay)
-                    continue
-                logger.error("Failed to fetch weather markets: %s", exc)
-                return []
+        """Fetch active weather markets. Uses authenticated request."""
+        result = self._request("GET", "/api/markets?tags=weather&status=active&limit=100")
+        if "error" in result:
+            logger.error("Failed to fetch weather markets: %s", result["error"])
+            return []
+        return result.get("markets", [])
 
     # ------------------------------------------------------------------
     # Positions

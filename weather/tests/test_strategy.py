@@ -1,6 +1,7 @@
 """Integration tests for the strategy module — mocked API calls."""
 
 import json
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -193,6 +194,65 @@ class TestStrategyIntegration(unittest.TestCase):
 
         # No trades should have been executed
         client.execute_trade.assert_not_called()
+
+
+class TestActiveLocations(unittest.TestCase):
+    """Regression: active_locations must map to canonical LOCATIONS keys."""
+
+    def test_nyc_uppercase_input(self):
+        cfg = Config(locations="NYC")
+        self.assertEqual(cfg.active_locations, ["NYC"])
+
+    def test_chicago_lowercase_input(self):
+        cfg = Config(locations="chicago")
+        self.assertEqual(cfg.active_locations, ["Chicago"])
+
+    def test_multiple_locations_mixed_case(self):
+        cfg = Config(locations="nyc,Chicago,seattle")
+        self.assertEqual(cfg.active_locations, ["NYC", "Chicago", "Seattle"])
+
+    def test_all_locations(self):
+        cfg = Config(locations="NYC,Chicago,Seattle,Atlanta,Dallas,Miami")
+        self.assertEqual(
+            cfg.active_locations,
+            ["NYC", "Chicago", "Seattle", "Atlanta", "Dallas", "Miami"],
+        )
+
+
+class TestStateSaveLoad(unittest.TestCase):
+    """State roundtrip: save then load should preserve data."""
+
+    def test_roundtrip(self):
+        state = TradingState()
+        state.record_trade(
+            market_id="m-1", outcome_name="50-54", side="yes",
+            cost_basis=0.10, shares=20.0, location="NYC",
+        )
+        state.mark_analyzed("m-2")
+
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            path = f.name
+
+        state.save(path)
+        loaded = TradingState.load(path)
+
+        self.assertIn("m-1", loaded.trades)
+        self.assertAlmostEqual(loaded.trades["m-1"].cost_basis, 0.10)
+        self.assertAlmostEqual(loaded.trades["m-1"].shares, 20.0)
+        self.assertIn("m-2", loaded.analyzed_markets)
+
+        Path(path).unlink()
+
+    def test_load_corrupted_file(self):
+        with tempfile.NamedTemporaryFile(suffix=".json", mode="w", delete=False) as f:
+            f.write("{corrupted json!!")
+            path = f.name
+
+        state = TradingState.load(path)
+        # Should return fresh state, not crash
+        self.assertEqual(len(state.trades), 0)
+
+        Path(path).unlink()
 
 
 if __name__ == "__main__":
